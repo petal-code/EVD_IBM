@@ -8,112 +8,86 @@ using namespace Rcpp;
 
 // ==============================================================================
 // Global state — initialized once per territory via init_edge_builder()
-//
-// Design:
-//   - Sample all community contacts from prem_unique (sum of daily+weekly+monthly)
-//   - Allocate each sampled edge to a stratum (daily/weekly/monthly) via
-//     Multinomial(1, [p_daily, p_weekly, p_monthly]) per participant age group
-//   - Assign is_physical flag via Bernoulli(phys_ratio[age_i, age_j])
-//   This guarantees zero cross-stratum duplicate edges by construction.
 // ==============================================================================
 
+// Bucket kernel weights: 4 buckets
+// 0: d=0.5km (same cell), 1: 1-10km, 2: 10-100km, 3: 100-1000km
 static double g_w_bucket[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
 
+// Bucket index matrix: n_cells × n_cells (uint8, row-major)
+// Value 0-3 = bucket index, 255 = beyond max radius (unused with full matrix)
 static std::vector<uint8_t> g_bucket_mat;
 static int g_n_cells = 0;
 
 // cell_age_members[cell_idx * 16 + age_group] = vector of person indices
-static std::vector<std::vector<int>> g_cell_age_members;
+// Flattened for cache efficiency
+static std::vector<std::vector<int>> g_cell_age_members;  // size: n_cells * 16
 
-// prem_unique: row-normalized contact probabilities q[age_i * 16 + age_j]
-static std::vector<double> g_prem_q;
-static std::vector<double> g_prem_mu;  // rowSums of prem_unique (mean degree)
+// Prem multinomial probabilities: q[age_i * 16 + age_j] = M_ij / m_i
+static std::vector<double> g_prem_q;   // size: 16 * 16
+static std::vector<double> g_prem_mu;  // size: 16 (row sums = m_i)
 
-// Stratum allocation probs: g_stratum_p[age_i * 3 + s]
-// s=0: daily, s=1: weekly, s=2: monthly
-static std::vector<double> g_stratum_p;
-
-// Physical ratio: g_phys_ratio[age_i * 16 + age_j]
-static std::vector<double> g_phys_ratio;
-
+// NB dispersion parameter
 static double g_nb_size = 0.1;
 
 // [[Rcpp::export]]
 void init_edge_builder(
-    NumericMatrix   bucket_mat_r,       // n_cells x n_cells bucket indices (0-4)
-    List            cell_age_members,   // list length n_cells*16, each = int vector
-    NumericMatrix   prem_unique,        // 16x16 unique contact matrix (daily+weekly+monthly)
-    NumericMatrix   stratum_prob_mat,   // 16x3 stratum allocation probs [p_daily, p_weekly, p_monthly]
-    NumericMatrix   phys_ratio_matrix,  // 16x16 blended physical ratio
-    NumericVector   bucket_weights,     // length 5: kernel weight per bucket
+    NumericMatrix   bucket_mat_r,     // n_cells × n_cells bucket indices (0-3)
+    List            cell_age_members, // list of length n_cells*16, each = int vector
+    NumericMatrix   prem_matrix,      // 16 × 16 Prem contact matrix
+    NumericVector   bucket_weights,   // length 4: kernel weight per bucket
     double          nb_size) {
 
   int n_cells = bucket_mat_r.nrow();
   g_n_cells   = n_cells;
   g_nb_size   = nb_size;
 
+  // Store bucket weights
   for (int b = 0; b < 5; ++b) g_w_bucket[b] = bucket_weights[b];
 
-  // Bucket matrix as uint8 (row-major)
+  // Store bucket matrix as uint8 vector (row-major)
   g_bucket_mat.resize((long long)n_cells * n_cells);
   for (int i = 0; i < n_cells; ++i)
     for (int j = 0; j < n_cells; ++j)
       g_bucket_mat[(long long)i * n_cells + j] = (uint8_t)bucket_mat_r(i, j);
 
-  // Cell-age member index
+  // Store cell-age members
   g_cell_age_members.resize(n_cells * 16);
   for (int idx = 0; idx < n_cells * 16; ++idx) {
     IntegerVector v = cell_age_members[idx];
     g_cell_age_members[idx] = std::vector<int>(v.begin(), v.end());
   }
 
-  // prem_unique -> row-normalized probabilities
+  // Store Prem matrix as probabilities q[i*16+j] = M_ij / m_i
   g_prem_q.resize(16 * 16);
   g_prem_mu.resize(16);
   for (int i = 0; i < 16; ++i) {
     double row_sum = 0.0;
-    for (int j = 0; j < 16; ++j) row_sum += prem_unique(i, j);
+    for (int j = 0; j < 16; ++j) row_sum += prem_matrix(i, j);
     g_prem_mu[i] = row_sum;
     for (int j = 0; j < 16; ++j)
-      g_prem_q[i * 16 + j] = (row_sum > 0) ? prem_unique(i, j) / row_sum : 0.0;
+      g_prem_q[i * 16 + j] = (row_sum > 0) ? prem_matrix(i, j) / row_sum : 0.0;
   }
-
-  // Stratum allocation probabilities: 16 x 3 (flat, row-major)
-  g_stratum_p.resize(16 * 3);
-  for (int i = 0; i < 16; ++i)
-    for (int s = 0; s < 3; ++s)
-      g_stratum_p[i * 3 + s] = stratum_prob_mat(i, s);
-
-  // Physical ratio matrix (flat, row-major)
-  g_phys_ratio.resize(16 * 16);
-  for (int i = 0; i < 16; ++i)
-    for (int j = 0; j < 16; ++j)
-      g_phys_ratio[i * 16 + j] = phys_ratio_matrix(i, j);
 }
 
 // [[Rcpp::export]]
 DataFrame build_edges_cpp(
-    IntegerVector active_ids,
-    IntegerVector cell_ids,
-    IntegerVector hh_ids,
-    IntegerVector age_groups,
+    IntegerVector active_ids,    // 1-based person indices
+    IntegerVector cell_ids,      // cell_id per person (1-based)
+    IntegerVector hh_ids,        // household id per person
+    IntegerVector age_groups,    // age group per person (1-based, 1-16)
     int           seed) {
 
   std::mt19937 rng(seed);
-  std::uniform_real_distribution<double> unif01(0.0, 1.0);
 
-  std::vector<int>     out_from, out_to;
-  std::vector<int>     out_stratum;     // 0=daily, 1=weekly, 2=monthly
-  std::vector<int>     out_is_physical; // 0/1
-
+  std::vector<int> out_from, out_to;
   out_from.reserve(active_ids.size() * 8);
   out_to.reserve(active_ids.size() * 8);
-  out_stratum.reserve(active_ids.size() * 8);
-  out_is_physical.reserve(active_ids.size() * 8);
 
   int n_active = active_ids.size();
 
   // Pre-compute cumulative Prem probabilities for Multinomial sampling
+  // cum_q[i][j] = sum_{k<=j} q[i*16+k]
   std::vector<std::vector<double>> cum_q(16, std::vector<double>(16));
   for (int i = 0; i < 16; ++i) {
     cum_q[i][0] = g_prem_q[i * 16];
@@ -121,28 +95,21 @@ DataFrame build_edges_cpp(
       cum_q[i][j] = cum_q[i][j-1] + g_prem_q[i * 16 + j];
   }
 
-  // Pre-compute cumulative stratum probs per age group
-  // cum_s[i][s] = sum_{k<=s} g_stratum_p[i*3+k]
-  std::vector<std::vector<double>> cum_s(16, std::vector<double>(3));
-  for (int i = 0; i < 16; ++i) {
-    cum_s[i][0] = g_stratum_p[i * 3];
-    cum_s[i][1] = cum_s[i][0] + g_stratum_p[i * 3 + 1];
-    cum_s[i][2] = 1.0;  // ensures last bucket catches remainder
-  }
-
   for (int k = 0; k < n_active; ++k) {
     if (k % 10000 == 0)
-      Rcpp::Rcout << "    edges: " << k << " / " << n_active << "\n" << std::flush;
+      Rcpp::Rcout << "    Layer 2: " << k << " / " << n_active << " persons\n" << std::flush;
 
-    int id_k  = active_ids[k];
-    int c_k   = cell_ids[id_k - 1] - 1;   // 0-based cell index
-    int hh_k  = hh_ids[id_k - 1];
-    int age_i = age_groups[id_k - 1] - 1;  // 0-based (0-15)
+    int id_k     = active_ids[k];           // 1-based
+    int c_k      = cell_ids[id_k - 1] - 1; // 0-based cell index
+    int hh_k     = hh_ids[id_k - 1];
+    int age_i    = age_groups[id_k - 1] - 1; // 0-based age group (0-15)
 
-    // ── Step 1: D_k ~ NB(mu_i, nb_size) ──────────────────────────────────
+    // ── Step 1: Draw total contacts D_k ~ NB(m_i, theta) ──────────────────
     double mu_i = g_prem_mu[age_i];
     if (mu_i <= 0.0) continue;
 
+    // NB parameterization: size=theta, mu=mu_i
+    // Use gamma-Poisson mixture: X ~ Poisson(lambda), lambda ~ Gamma(size, size/mu)
     std::gamma_distribution<double> gamma_dist(g_nb_size, mu_i / g_nb_size);
     double lambda = gamma_dist(rng);
     std::poisson_distribution<int> pois_dist(lambda);
@@ -153,7 +120,8 @@ DataFrame build_edges_cpp(
     int d_j[16] = {0};
     int remaining = D_k;
     for (int j = 0; j < 15 && remaining > 0; ++j) {
-      double p_remaining = 1.0 - (j > 0 ? cum_q[age_i][j-1] : 0.0);
+      // Draw from Binomial(remaining, p_j_given_remaining)
+      double p_remaining = (1.0 - (j > 0 ? cum_q[age_i][j-1] : 0.0));
       if (p_remaining <= 0.0) break;
       double p_j = g_prem_q[age_i * 16 + j] / p_remaining;
       p_j = std::min(std::max(p_j, 0.0), 1.0);
@@ -161,17 +129,18 @@ DataFrame build_edges_cpp(
       d_j[j] = binom(rng);
       remaining -= d_j[j];
     }
-    d_j[15] = remaining;
+    d_j[15] = remaining;  // Last group gets remainder
 
     // ── Step 3: For each age group j, sample d_j contacts ─────────────────
     for (int j = 0; j < 16; ++j) {
       if (d_j[j] == 0) continue;
 
-      // Physical ratio for (age_i, age_j) cell
-      double p_phys = g_phys_ratio[age_i * 16 + j];
-      p_phys = std::min(std::max(p_phys, 0.0), 1.0);
+      // Build weighted cell candidate list.
+      // Weight = w_bucket[b] * (n_age_j[c] / bucket_total_pop[b])
+      // This ensures inter-bucket allocation follows kernel proportions,
+      // while within each bucket, cells are selected proportional to population.
 
-      // Build kernel-weighted cell candidate list
+      // First pass: compute per-bucket total population for normalization
       double bucket_pop[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
       for (int c = 0; c < g_n_cells; ++c) {
         int n_members = (int)g_cell_age_members[c * 16 + j].size();
@@ -180,6 +149,7 @@ DataFrame build_edges_cpp(
         bucket_pop[bucket] += n_members;
       }
 
+      // Second pass: normalized weights
       std::vector<int>    cand_cells;
       std::vector<double> cand_weights;
       cand_cells.reserve(g_n_cells);
@@ -191,6 +161,7 @@ DataFrame build_edges_cpp(
         if (n_members == 0) continue;
         uint8_t bucket = g_bucket_mat[(long long)c_k * g_n_cells + c];
         if (bucket_pop[bucket] <= 0.0) continue;
+        // w_bucket controls inter-bucket ratio; n_members/bucket_pop within-bucket ratio
         double w = g_w_bucket[bucket] * (double)n_members / bucket_pop[bucket];
         if (w <= 0.0) continue;
         cand_cells.push_back(c);
@@ -200,43 +171,33 @@ DataFrame build_edges_cpp(
 
       if (cand_cells.empty() || w_total <= 0.0) continue;
 
-      // Cumulative weights for binary-search sampling
+      // Sample d_j contacts from weighted cells (with replacement)
+      std::uniform_real_distribution<double> udist(0.0, w_total);
+
+      // Pre-compute cumulative weights
       std::vector<double> cum_w(cand_cells.size());
       cum_w[0] = cand_weights[0];
       for (int ci = 1; ci < (int)cand_cells.size(); ++ci)
         cum_w[ci] = cum_w[ci-1] + cand_weights[ci];
 
-      std::uniform_real_distribution<double> udist(0.0, w_total);
-
       for (int s = 0; s < d_j[j]; ++s) {
-
-        // Sample cell proportional to kernel × population
+        // Sample a cell proportional to kernel × population
         double u = udist(rng);
         int chosen_c = (int)(std::lower_bound(cum_w.begin(), cum_w.end(), u)
                                - cum_w.begin());
         chosen_c = std::min(chosen_c, (int)cand_cells.size() - 1);
         int c_j = cand_cells[chosen_c];
 
-        // Sample a person uniformly from age group j in cell c_j
+        // Sample a person uniformly from age_group j in cell c_j
         const std::vector<int>& members = g_cell_age_members[c_j * 16 + j];
         std::uniform_int_distribution<int> uid(0, (int)members.size() - 1);
-        int cand_id = members[uid(rng)];
+        int cand_id = members[uid(rng)];  // 1-based person id
 
         // Exclude self and same household
         if (cand_id == id_k) continue;
         if (hh_ids[cand_id - 1] == hh_k) continue;
 
-        // ── Step 4: Stratum allocation via Multinomial(1, [p_d, p_w, p_m]) ──
-        // Use age_i (participant) perspective for stratum assignment
-        double u_s   = unif01(rng);
-        int stratum  = 2;  // default: monthly
-        if      (u_s < cum_s[age_i][0]) stratum = 0;  // daily
-        else if (u_s < cum_s[age_i][1]) stratum = 1;  // weekly
-
-        // ── Step 5: Physical flag via Bernoulli(p_phys) ───────────────────
-        int is_phys = (unif01(rng) < p_phys) ? 1 : 0;
-
-        // Store as undirected edge (from < to convention)
+        // Store as undirected edge (i < j convention)
         if (cand_id > id_k) {
           out_from.push_back(id_k);
           out_to.push_back(cand_id);
@@ -244,16 +205,12 @@ DataFrame build_edges_cpp(
           out_from.push_back(cand_id);
           out_to.push_back(id_k);
         }
-        out_stratum.push_back(stratum);
-        out_is_physical.push_back(is_phys);
       }
     }
   }
 
   return DataFrame::create(
-    Named("from")        = IntegerVector(out_from.begin(),        out_from.end()),
-    Named("to")          = IntegerVector(out_to.begin(),          out_to.end()),
-    Named("stratum")     = IntegerVector(out_stratum.begin(),     out_stratum.end()),
-    Named("is_physical") = IntegerVector(out_is_physical.begin(), out_is_physical.end())
+    Named("from") = IntegerVector(out_from.begin(), out_from.end()),
+    Named("to")   = IntegerVector(out_to.begin(),   out_to.end())
   );
 }

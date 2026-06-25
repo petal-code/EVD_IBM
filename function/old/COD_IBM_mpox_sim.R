@@ -1,16 +1,16 @@
 # ==============================================================================
-# COD_IBM_ebola_sim.R
+# COD_IBM_mpox_sim.R
 # Purpose:
-#   Individual-based transmission model for DRC
-#   Network structure: pre-built contact network (Layer 1/2/3)
+#   Individual-based mpox transmission model for DRC
 #
 # Architecture:
-#   - sim_prep: pre-built adj lists loaded once, O(1) neighbor lookup
-#   - Individual state stored as flat vectors (not data.frame) for speed
+#   - Individual state stored as flat vectors for speed
 #   - Pre-allocated queue with grow-on-demand
 #   - infect_individual() defined inside main function → <<- direct vector writes
-#   - p_inf varies by frequency stratum (daily/weekly/monthly)
-#     via 1-(1-p)^n over 3-week window
+#   - Neighbor lookup: data.table with key on 'from' (bidirectional edge list)
+#     → only infected individuals' neighbors ever queried (memory efficient)
+#   - p_inf varies by contact frequency stratum (daily/weekly/monthly)
+#     via 1-(1-p)^n accumulation over 3-week window
 #
 # contact_type codes:
 #   0L = index
@@ -22,15 +22,16 @@
 #   6L = funeral community
 # ==============================================================================
 
-ebola_network_sim <- function(
+mpox_network_sim <- function(
 
-  # ── sim_prep (from C2_sim_p0_simprep.R) ──────────────────────────────────
-  sim_prep,   # list(N, pid_to_idx,
-  #      hh_nbrs,
-  #      comm_close_daily_nbrs, comm_close_weekly_nbrs, comm_close_monthly_nbrs,
-  #      comm_phys_daily_nbrs,  comm_phys_weekly_nbrs,  comm_phys_monthly_nbrs,
-  #      hcw_nbrs, adm_nbrs)
-  nodes,
+  # ── Network (edge lists) ──────────────────────────────────────────────────
+  nodes,    # person_id, hh_id, cell_id, hospital_id, age_group, is_hcw
+  layer1,   # from, to
+  layer2d,  # from, to, is_physical  (daily)
+  layer2w,  # from, to, is_physical  (weekly)
+  layer2m,  # from, to, is_physical  (monthly)
+  layer3h,  # from, to, hospital_id  (HCW-HCW)
+  layer3a,  # person_id, hospital_id, hcw_list
 
   # ── Seeding ───────────────────────────────────────────────────────────────
   seeding_cases    = 1L,
@@ -130,6 +131,7 @@ ebola_network_sim <- function(
 ) {
 
   set.seed(seed)
+  library(data.table)
 
   # ── Helpers ───────────────────────────────────────────────────────────────
   resolve_tv <- function(param, t) {
@@ -143,7 +145,7 @@ ebola_network_sim <- function(
     1 - (1 - p)^n
   }
 
-  # Pre-compute 3-week effective p_inf per stratum (once at start)
+  # Pre-compute 3-week effective p_inf per stratum
   p_eff_close_daily    <- p_cumul(p_inf_community_close_daily,    21)
   p_eff_close_weekly   <- p_cumul(p_inf_community_close_weekly,   3)
   p_eff_close_monthly  <- p_cumul(p_inf_community_close_monthly,  0.75)
@@ -151,7 +153,7 @@ ebola_network_sim <- function(
   p_eff_phys_weekly    <- p_cumul(p_inf_community_physical_weekly,  3)
   p_eff_phys_monthly   <- p_cumul(p_inf_community_physical_monthly, 0.75)
 
-  # PK/PD drug efficacy (one-compartment PK + Emax PD)
+  # PK/PD drug efficacy
   compute_drug_eff <- function(t_current, t_treated, pd_params, pk_params) {
     if (is.null(pk_params) || is.null(pd_params)) return(0)
     dt <- t_current - t_treated
@@ -160,35 +162,88 @@ ebola_network_sim <- function(
     pd_params$emax * conc / (pd_params$ec50 + conc)
   }
 
-  # ── Load sim_prep (O(1) neighbor lookup) ──────────────────────────────────
-  message("Loading sim_prep...")
-  N                       <- sim_prep$N
-  pid_to_idx              <- sim_prep$pid_to_idx
-  hh_nbrs                 <- sim_prep$hh_nbrs
-  comm_close_daily_nbrs   <- sim_prep$comm_close_daily_nbrs
-  comm_close_weekly_nbrs  <- sim_prep$comm_close_weekly_nbrs
-  comm_close_monthly_nbrs <- sim_prep$comm_close_monthly_nbrs
-  comm_phys_daily_nbrs    <- sim_prep$comm_phys_daily_nbrs
-  comm_phys_weekly_nbrs   <- sim_prep$comm_phys_weekly_nbrs
-  comm_phys_monthly_nbrs  <- sim_prep$comm_phys_monthly_nbrs
-  hcw_nbrs                <- sim_prep$hcw_nbrs
-  adm_nbrs                <- sim_prep$adm_nbrs
-  message(sprintf("  Loaded for %d individuals", N))
+  # ── Person ID lookup ──────────────────────────────────────────────────────
+  N          <- nrow(nodes)
+  person_ids <- nodes$person_id
+  max_pid    <- max(person_ids)
 
-  # ── Ring helpers ──────────────────────────────────────────────────────────
-  get_all_comm_nbrs <- function(idx) {
-    unique(c(comm_close_daily_nbrs[[idx]],  comm_phys_daily_nbrs[[idx]],
-             comm_close_weekly_nbrs[[idx]], comm_phys_weekly_nbrs[[idx]],
-             comm_close_monthly_nbrs[[idx]],comm_phys_monthly_nbrs[[idx]]))
+  pid_to_idx <- integer(max_pid + 1L)
+  pid_to_idx[person_ids + 1L] <- seq_len(N)
+  pid2idx <- function(pid) pid_to_idx[pid + 1L]
+
+  # ── Build bidirectional data.tables with key on 'from' ───────────────────
+  # Duplicate each edge in both directions so querying by 'from' covers both ends.
+  # This avoids a full scan on 'to' while keeping memory at 2x original edge list.
+  message("Preparing edge lookup tables...")
+
+  make_bidir_dt <- function(edges, extra_cols = NULL) {
+    cols <- c("from", "to", extra_cols)
+    e    <- as.data.table(edges)[, ..cols]
+    rev  <- copy(e)
+    rev[, c("from","to") := .(to, from)]
+    dt <- rbind(e, rev)
+    setkey(dt, from)
+    dt
   }
 
-  get_ring1_all <- function(idx)
-    unique(c(hh_nbrs[[idx]], get_all_comm_nbrs(idx)))
+  dt_layer1  <- make_bidir_dt(layer1)
+  dt_layer2d <- make_bidir_dt(layer2d, "is_physical")
+  dt_layer2w <- make_bidir_dt(layer2w, "is_physical")
+  dt_layer2m <- make_bidir_dt(layer2m, "is_physical")
+  dt_layer3h <- make_bidir_dt(layer3h)
 
-  get_ring2_all <- function(idx) {
-    r1 <- get_ring1_all(idx)
+  # Admission lookup: person_id -> HCW indices
+  adm_lookup <- list()
+  for (k in seq_len(nrow(layer3a))) {
+    pid  <- as.character(layer3a$person_id[k])
+    hcws <- layer3a$hcw_list[[k]]
+    if (!is.null(hcws) && length(hcws) > 0)
+      adm_lookup[[pid]] <- pid2idx(hcws)
+  }
+  message("  Edge tables ready")
+
+  # ── Neighbor accessor functions ───────────────────────────────────────────
+  get_nbrs_l1 <- function(pid) {
+    e <- dt_layer1[.(pid), to]
+    idx <- pid2idx(e[!is.na(e)])
+    idx[idx > 0L]
+  }
+
+  get_nbrs_l2 <- function(pid, dt, physical_only) {
+    e <- dt[.(pid)]
+    if (nrow(e) == 0L) return(integer(0))
+    e <- if (physical_only) e[is_physical == 1L] else e[is_physical == 0L]
+    idx <- pid2idx(e$to)
+    idx[!is.na(idx) & idx > 0L]
+  }
+
+  get_nbrs_hcw <- function(pid) {
+    e <- dt_layer3h[.(pid), to]
+    idx <- pid2idx(e[!is.na(e)])
+    idx[idx > 0L]
+  }
+
+  get_adm_nbrs <- function(pid) {
+    v <- adm_lookup[[as.character(pid)]]
+    if (is.null(v)) integer(0) else v
+  }
+
+  get_all_comm_nbrs <- function(pid) {
+    unique(c(
+      get_nbrs_l2(pid, dt_layer2d, FALSE), get_nbrs_l2(pid, dt_layer2d, TRUE),
+      get_nbrs_l2(pid, dt_layer2w, FALSE), get_nbrs_l2(pid, dt_layer2w, TRUE),
+      get_nbrs_l2(pid, dt_layer2m, FALSE), get_nbrs_l2(pid, dt_layer2m, TRUE)
+    ))
+  }
+
+  get_ring1_all <- function(pid)
+    unique(c(get_nbrs_l1(pid), get_all_comm_nbrs(pid)))
+
+  get_ring2_all <- function(pid) {
+    r1 <- get_ring1_all(pid)
     if (length(r1) == 0L) return(integer(0))
-    unique(unlist(lapply(r1, get_ring1_all), use.names = FALSE))
+    r1_pids <- person_ids[r1]
+    unique(unlist(lapply(r1_pids, get_ring1_all), use.names = FALSE))
   }
 
   # ── State vectors ─────────────────────────────────────────────────────────
@@ -319,7 +374,7 @@ ebola_network_sim <- function(
 
   # ── Seed cases ────────────────────────────────────────────────────────────
   seed_idx <- if (!is.null(seeding_ids)) {
-    pid_to_idx[seeding_ids + 1L]
+    pid2idx(seeding_ids)
   } else {
     sample(seq_len(N), seeding_cases, replace = FALSE)
   }
@@ -405,6 +460,7 @@ ebola_network_sim <- function(
     t_out_idx   <- time_outcome[idx]
     is_hcw_idx  <- isTRUE(v_is_hcw[idx])
     gen_idx     <- generation[idx]
+    pid_idx     <- v_person_id[idx]
 
     eff_trans_src <- if (treated[idx] == 1L) {
       if (!is.null(pk_params))
@@ -433,29 +489,31 @@ ebola_network_sim <- function(
                    t_onset_idx >= quarantine_start))
       t_onset_idx + logistical_delay else Inf
 
-    # Ring interventions (O(1) lookup from sim_prep)
+    # Ring interventions
     if (is.finite(t_ring)) {
-      apply_ring(hh_nbrs[[idx]],
+      apply_ring(get_nbrs_l1(pid_idx),
                  prob_trace_household,
                  prob_treat_given_trace_household,
                  prob_quarantine_given_trace_household,
                  "household", t_ring, logistical_delay)
 
-      apply_ring(unique(c(comm_close_daily_nbrs[[idx]],
-                          comm_close_weekly_nbrs[[idx]],
-                          comm_close_monthly_nbrs[[idx]])),
-                 prob_trace_close,
-                 prob_treat_given_trace_close,
-                 prob_quarantine_given_trace_close,
-                 "close", t_ring, logistical_delay)
+      apply_ring(unique(c(
+        get_nbrs_l2(pid_idx, dt_layer2d, FALSE),
+        get_nbrs_l2(pid_idx, dt_layer2w, FALSE),
+        get_nbrs_l2(pid_idx, dt_layer2m, FALSE))),
+        prob_trace_close,
+        prob_treat_given_trace_close,
+        prob_quarantine_given_trace_close,
+        "close", t_ring, logistical_delay)
 
-      apply_ring(unique(c(comm_phys_daily_nbrs[[idx]],
-                          comm_phys_weekly_nbrs[[idx]],
-                          comm_phys_monthly_nbrs[[idx]])),
-                 prob_trace_physical,
-                 prob_treat_given_trace_physical,
-                 prob_quarantine_given_trace_physical,
-                 "physical", t_ring, logistical_delay)
+      apply_ring(unique(c(
+        get_nbrs_l2(pid_idx, dt_layer2d, TRUE),
+        get_nbrs_l2(pid_idx, dt_layer2w, TRUE),
+        get_nbrs_l2(pid_idx, dt_layer2m, TRUE))),
+        prob_trace_physical,
+        prob_treat_given_trace_physical,
+        prob_quarantine_given_trace_physical,
+        "physical", t_ring, logistical_delay)
     }
 
     # =========================================================================
@@ -464,29 +522,29 @@ ebola_network_sim <- function(
     t_phase1_end <- if (!is.na(t_hosp_idx)) t_hosp_idx else t_out_idx
 
     phase1_groups <- list(
-      list(nbrs = hh_nbrs[[idx]],
-           p_inf = p_inf_household,      ctype = 1L),
-      list(nbrs = comm_close_daily_nbrs[[idx]],
-           p_inf = p_eff_close_daily,    ctype = 2L),
-      list(nbrs = comm_close_weekly_nbrs[[idx]],
-           p_inf = p_eff_close_weekly,   ctype = 2L),
-      list(nbrs = comm_close_monthly_nbrs[[idx]],
-           p_inf = p_eff_close_monthly,  ctype = 2L),
-      list(nbrs = comm_phys_daily_nbrs[[idx]],
-           p_inf = p_eff_phys_daily,     ctype = 3L),
-      list(nbrs = comm_phys_weekly_nbrs[[idx]],
-           p_inf = p_eff_phys_weekly,    ctype = 3L),
-      list(nbrs = comm_phys_monthly_nbrs[[idx]],
-           p_inf = p_eff_phys_monthly,   ctype = 3L)
+      list(nbrs = get_nbrs_l1(pid_idx),
+           p_inf = p_inf_household,       ctype = 1L),
+      list(nbrs = get_nbrs_l2(pid_idx, dt_layer2d, FALSE),
+           p_inf = p_eff_close_daily,     ctype = 2L),
+      list(nbrs = get_nbrs_l2(pid_idx, dt_layer2w, FALSE),
+           p_inf = p_eff_close_weekly,    ctype = 2L),
+      list(nbrs = get_nbrs_l2(pid_idx, dt_layer2m, FALSE),
+           p_inf = p_eff_close_monthly,   ctype = 2L),
+      list(nbrs = get_nbrs_l2(pid_idx, dt_layer2d, TRUE),
+           p_inf = p_eff_phys_daily,      ctype = 3L),
+      list(nbrs = get_nbrs_l2(pid_idx, dt_layer2w, TRUE),
+           p_inf = p_eff_phys_weekly,     ctype = 3L),
+      list(nbrs = get_nbrs_l2(pid_idx, dt_layer2m, TRUE),
+           p_inf = p_eff_phys_monthly,    ctype = 3L)
     )
 
-    # HCW pre-admission hospital contacts
-    if (is_hcw_idx && length(hcw_nbrs[[idx]]) > 0 &&
-        rbinom(1, 1, prob_hospital_cond_hcw_preAdm) == 1L) {
-      phase1_groups[[length(phase1_groups) + 1L]] <- list(
-        nbrs  = hcw_nbrs[[idx]],
-        p_inf = p_inf_hcw_to_hcw * (1 - ppe_efficacy_hcw),
-        ctype = 4L)
+    if (is_hcw_idx && rbinom(1, 1, prob_hospital_cond_hcw_preAdm) == 1L) {
+      hcw_now <- get_nbrs_hcw(pid_idx)
+      if (length(hcw_now) > 0)
+        phase1_groups[[length(phase1_groups) + 1L]] <- list(
+          nbrs  = hcw_now,
+          p_inf = p_inf_hcw_to_hcw * (1 - ppe_efficacy_hcw),
+          ctype = 4L)
     }
 
     for (grp in phase1_groups) {
@@ -507,11 +565,11 @@ ebola_network_sim <- function(
     # =========================================================================
     if (!is.na(t_hosp_idx)) {
       if (is_hcw_idx) {
-        phase2_nbrs <- hcw_nbrs[[idx]]
+        phase2_nbrs <- get_nbrs_hcw(pid_idx)
         p_inf_p2    <- if (length(phase2_nbrs) > 0)
           p_inf_hcw_to_hcw / length(phase2_nbrs) else 0
       } else {
-        phase2_nbrs <- adm_nbrs[[idx]]
+        phase2_nbrs <- get_adm_nbrs(pid_idx)
         p_inf_p2    <- if (length(phase2_nbrs) > 0)
           p_inf_patient_to_hcw / length(phase2_nbrs) else 0
       }
@@ -522,7 +580,6 @@ ebola_network_sim <- function(
         if (t_inf_nbr > t_out_idx) next
         if (!passes_gates(idx, nbr_id, t_inf_nbr, p_inf_p2, eff_trans_src)) next
 
-        # HCW PEP on exposure
         if (isTRUE(v_is_hcw[nbr_id]) && prob_treat_hcw_pep > 0 &&
             treated[nbr_id] == 0L &&
             rbinom(1, 1, prob_treat_hcw_pep) == 1L) {
@@ -538,7 +595,6 @@ ebola_network_sim <- function(
 
     # =========================================================================
     # Phase 3: funeral (death only)
-    # NegBin attendee count; recruit household → 1-ring → 2-ring
     # =========================================================================
     if (isTRUE(outcome_death[idx])) {
 
@@ -546,12 +602,10 @@ ebola_network_sim <- function(
       is_unsafe    <- isTRUE(funeral_unsafe_vec[idx])
       funeral_mult <- if (is_unsafe) funeral_unsafe_multiplier else funeral_safe_multiplier
 
-      # Pool 1: household (all attend)
-      hh_att    <- hh_nbrs[[idx]]
+      hh_att    <- get_nbrs_l1(pid_idx)
       remaining <- max(0L, funedgenum - length(hh_att))
 
-      # Pool 2: 1-ring community
-      comm_1ring <- setdiff(get_all_comm_nbrs(idx), hh_att)
+      comm_1ring <- setdiff(get_all_comm_nbrs(pid_idx), hh_att)
       comm_att   <- integer(0)
       if (remaining > 0L && length(comm_1ring) > 0L) {
         n_draw    <- min(remaining, length(comm_1ring))
@@ -559,10 +613,9 @@ ebola_network_sim <- function(
         remaining <- remaining - n_draw
       }
 
-      # Pool 3: 2-ring
       ring2_att <- integer(0)
       if (remaining > 0L) {
-        ring2_all <- setdiff(get_ring2_all(idx), c(hh_att, comm_att, idx))
+        ring2_all <- setdiff(get_ring2_all(pid_idx), c(hh_att, comm_att, idx))
         if (length(ring2_all) > 0L) {
           n_draw    <- min(remaining, length(ring2_all))
           ring2_att <- sample(ring2_all, n_draw, replace = FALSE)
@@ -571,22 +624,14 @@ ebola_network_sim <- function(
 
       all_comm_att <- unique(c(comm_att, ring2_att))
 
-      # Record funeral attendance
-      # Use local() with explicit parent environment assignment to avoid
-      # <<- scope issues caused by get_ring2_all() creating nested environments
-      fa  <- funeral_attended_for
-      frv <- funeral_role_vec
       for (att_id in c(hh_att, all_comm_att)) {
-        if (is.na(fa[att_id])) {
-          fa[att_id]  <- v_person_id[idx]
-          frv[att_id] <- if (att_id %in% hh_att) "household" else "community"
+        if (is.na(funeral_attended_for[att_id])) {
+          funeral_attended_for[att_id] <<- v_person_id[idx]
+          funeral_role_vec[att_id]     <<- if (att_id %in% hh_att)
+            "household" else "community"
         }
       }
-      funeral_attended_for <<- fa
-      funeral_role_vec     <<- frv
-      rm(fa, frv)
 
-      # Funeral ring tracing
       if (is.finite(t_ring)) {
         apply_ring(c(hh_att, all_comm_att),
                    prob_trace_funeral,
@@ -595,7 +640,6 @@ ebola_network_sim <- function(
                    "funeral", t_ring, logistical_delay)
       }
 
-      # Transmission
       p_inf_f_hh   <- p_inf_funeral_household * funeral_mult
       p_inf_f_comm <- p_inf_funeral_community * funeral_mult
 
