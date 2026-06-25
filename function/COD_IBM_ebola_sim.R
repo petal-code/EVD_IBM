@@ -57,7 +57,10 @@ ebola_network_sim <- function(
   # Per single contact-event probability.
   # 3-week effective prob = 1-(1-p)^n computed internally:
   #   daily n=21, weekly n=3, monthly n=0.75
-  p_inf_household,
+  p_inf_household_close,
+  p_inf_household_physical,
+  close_only_home,    # 16x16: Prem home × (1 - blended_ratio$home), from p6
+  phys_only_home,     # 16x16: Prem home × blended_ratio$home, from p6
 
   p_inf_community_close_daily    = 0,
   p_inf_community_close_weekly   = 0,
@@ -463,9 +466,26 @@ ebola_network_sim <- function(
     # =========================================================================
     t_phase1_end <- if (!is.na(t_hosp_idx)) t_hosp_idx else t_out_idx
 
+    # Household: p_eff per edge based on age-group combination
+    # p_eff = p_inf_household_close    * close_only_home[age_i, age_j]
+    #       + p_inf_household_physical * phys_only_home[age_i, age_j]
+    age_i_idx <- v_age_group[idx]
+    hh_nbrs_now <- hh_nbrs[[idx]]
+    for (nbr_id in hh_nbrs_now) {
+      if (status[nbr_id] != 1L) next
+      age_j_idx <- v_age_group[nbr_id]
+      p_eff_hh  <- p_inf_household_close    * close_only_home[age_i_idx, age_j_idx] +
+        p_inf_household_physical * phys_only_home[age_i_idx,  age_j_idx]
+      if (p_eff_hh <= 0) next
+      t_inf_nbr <- t_inf_idx + generation_time_fn(1)
+      if (t_inf_nbr > t_phase1_end) next
+      if (!passes_gates(idx, nbr_id, t_inf_nbr, p_eff_hh, eff_trans_src)) next
+      infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, 1L)
+      enqueue(nbr_id, t_inf_nbr)
+      n_cumul_infected <- n_cumul_infected + 1L
+    }
+
     phase1_groups <- list(
-      list(nbrs = hh_nbrs[[idx]],
-           p_inf = p_inf_household,      ctype = 1L),
       list(nbrs = comm_close_daily_nbrs[[idx]],
            p_inf = p_eff_close_daily,    ctype = 2L),
       list(nbrs = comm_close_weekly_nbrs[[idx]],

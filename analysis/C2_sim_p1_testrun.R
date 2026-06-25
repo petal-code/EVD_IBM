@@ -33,6 +33,12 @@ message(sprintf("=== Loading: %s ===", case_tag))
 nodes    <- readRDS(file.path(network_dir, sprintf("%s_nodes.rds",      case_tag)))
 sim_prep <- readRDS(file.path(network_dir, sprintf("%s_sim_prep.rds",   case_tag)))
 
+# Household contact matrices from p6
+mats_path <- "output/MPMmat/DRC_network_input_matrices.rds"
+mats_p6   <- readRDS(mats_path)
+close_only_home <- mats_p6$close_only_home  # 16x16
+phys_only_home  <- mats_p6$phys_only_home   # 16x16
+
 message(sprintf("  N = %d | HCWs = %d", nrow(nodes), sum(nodes$is_hcw)))
 
 if (!is.null(index_case_id)) {
@@ -65,7 +71,8 @@ generation_time_fn             <- make_gamma_fn(12, 4)
 # [Section 3] Transmission parameters
 # ==============================================================================
 
-p_inf_household                  <- 0.10
+p_inf_household_close            <- 0.05
+p_inf_household_physical         <- 0.15
 
 # Per single contact-event probability (3-week effective computed internally)
 p_inf_community_close_daily      <- 0.00
@@ -119,7 +126,10 @@ result <- ebola_network_sim(
   prob_death_comm           = prob_death_comm,
   prob_death_hosp           = prob_death_hosp,
 
-  p_inf_household                  = p_inf_household,
+  p_inf_household_close            = p_inf_household_close,
+  p_inf_household_physical         = p_inf_household_physical,
+  close_only_home                  = close_only_home,
+  phys_only_home                   = phys_only_home,
   p_inf_community_close_daily      = p_inf_community_close_daily,
   p_inf_community_close_weekly     = p_inf_community_close_weekly,
   p_inf_community_close_monthly    = p_inf_community_close_monthly,

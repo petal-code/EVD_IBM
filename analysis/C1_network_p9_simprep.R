@@ -76,10 +76,8 @@ build_adj_list <- function(edges, n, pid_to_idx,
 # [Section 2] Build neighbor lists
 # ==============================================================================
 
-message("  Building Layer 1 household close (is_physical=0)...")
-hh_close_nbrs <- build_adj_list(layer1, N, pid_to_idx, "is_physical", 0L)
-message("  Building Layer 1 household physical (is_physical=1)...")
-hh_phys_nbrs  <- build_adj_list(layer1, N, pid_to_idx, "is_physical", 1L)
+message("  Building Layer 1 (household)...")
+hh_nbrs <- build_adj_list(layer1, N, pid_to_idx)
 
 message("  Building Layer 2 daily close...")
 comm_close_daily_nbrs <- build_adj_list(layer2d, N, pid_to_idx,
@@ -124,8 +122,7 @@ for (k in seq_len(nrow(layer3a))) {
 
 mean_deg <- function(lst) mean(sapply(lst, length))
 message("\n  === Neighbor list summary ===")
-message(sprintf("  HH close           : %.2f", mean_deg(hh_close_nbrs)))
-message(sprintf("  HH physical        : %.2f", mean_deg(hh_phys_nbrs)))
+message(sprintf("  HH                 : %.2f", mean_deg(hh_nbrs)))
 message(sprintf("  Comm close daily   : %.2f", mean_deg(comm_close_daily_nbrs)))
 message(sprintf("  Comm close weekly  : %.2f", mean_deg(comm_close_weekly_nbrs)))
 message(sprintf("  Comm close monthly : %.2f", mean_deg(comm_close_monthly_nbrs)))
@@ -142,8 +139,7 @@ message(sprintf("  Admission HCWs     : %.2f", mean_deg(adm_nbrs)))
 sim_prep <- list(
   N                       = N,
   pid_to_idx              = pid_to_idx,
-  hh_close_nbrs           = hh_close_nbrs,
-  hh_phys_nbrs            = hh_phys_nbrs,
+  hh_nbrs                 = hh_nbrs,
   comm_close_daily_nbrs   = comm_close_daily_nbrs,
   comm_close_weekly_nbrs  = comm_close_weekly_nbrs,
   comm_close_monthly_nbrs = comm_close_monthly_nbrs,
