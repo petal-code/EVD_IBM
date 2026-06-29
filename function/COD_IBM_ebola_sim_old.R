@@ -9,7 +9,8 @@
 #   - Individual state stored as flat vectors (not data.frame) for speed
 #   - Pre-allocated queue with grow-on-demand
 #   - infect_individual() defined inside main function → <<- direct vector writes
-#   - p_inf supplied directly as per-edge probability (no frequency accumulation)
+#   - p_inf varies by frequency stratum (daily/weekly/monthly)
+#     via 1-(1-p)^n over 3-week window
 #
 # contact_type codes:
 #   0L = index
@@ -44,7 +45,6 @@ ebola_network_sim <- function(
   hospitalisation_to_death_fn,
   hospitalisation_to_recovery_fn,
   generation_time_fn,
-  funeral_generation_time_fn    = NULL,  # separate Gamma for funeral infections (fiber: shape=20, rate=10, mean=2d)
 
   # ── Disease severity ──────────────────────────────────────────────────────
   prob_symptomatic             = 1.0,
@@ -54,9 +54,9 @@ ebola_network_sim <- function(
   prob_death_hosp,
 
   # ── Transmission probabilities ────────────────────────────────────────────
-  # Per-edge probability supplied directly (frequency-dependent, not accumulated).
-  # daily/weekly/monthly edges are separate network layers; p_inf is applied
-  # once per edge per transmission attempt.
+  # Per single contact-event probability.
+  # 3-week effective prob = 1-(1-p)^n computed internally:
+  #   daily n=21, weekly n=3, monthly n=0.75
   p_inf_household_close,
   p_inf_household_physical,
   close_only_home,    # 16x16: Prem home × (1 - blended_ratio$home), from p6
@@ -82,20 +82,8 @@ ebola_network_sim <- function(
   funeral_unsafe_multiplier    = 1.0,
   funeral_safe_multiplier      = 0.1,
 
-  # ── Time-varying response parameters (scalar or function(t)) ─────────────
-  # Following fiber framework: each can be a fixed scalar or function(t)
-  prob_hospitalised_genPop_fn   = NULL,  # overrides prob_hospitalised_genPop if supplied
-  hospitalisation_delay_factor  = 1.0,   # scalar or function(t_onset): multiplier on onset_to_hosp draws
-  p_unsafe_funeral_comm_fn      = NULL,  # overrides p_unsafe_funeral for community deaths
-  p_unsafe_funeral_hosp_fn      = NULL,  # probability of unsafe funeral after hospital death
-  prop_etu_fn                   = NULL,  # scalar or function(t): proportion of hosp cases in ETU
-  ipc_index_fn                  = NULL,  # scalar or function(t): latent IPC/PPE response maturity [0,1]
-  etu_efficacy_baseline         = 0.80,  # fixed: baseline ETU transmission-blocking efficacy
-  non_etu_hospital_efficacy     = 0.30,  # fixed: non-ETU hospital transmission reduction
-
   # ── HCW-specific ──────────────────────────────────────────────────────────
-  ppe_coverage_fn               = 0,     # scalar or function(t): PPE coverage among HCWs
-  ppe_efficacy_hcw              = 0,     # fixed: PPE efficacy when worn correctly
+  ppe_efficacy_hcw              = 0,
   prob_hospital_cond_hcw_preAdm = 0.5,
 
   # ── Treatment ─────────────────────────────────────────────────────────────
@@ -147,49 +135,24 @@ ebola_network_sim <- function(
   set.seed(seed)
 
   # ── Helpers ───────────────────────────────────────────────────────────────
-  # fiber-style resolve: scalar or function(t), vectorised over t
   resolve_tv <- function(param, t) {
-    if (is.function(param)) param(t) else rep(param, length(t))
+    if (is.function(param)) param(t) else param
   }
 
-  # Resolve and clamp to [0, 1]
-  resolve_prob <- function(param, t) {
-    val <- resolve_tv(param, t)
-    pmin(pmax(val, 0), 1)
+  # 3-week cumulative p from per-contact p and frequency n
+  p_cumul <- function(p, n) {
+    if (p <= 0) return(0)
+    if (p >= 1) return(1)
+    1 - (1 - p)^n
   }
 
-  # Compute effective hospital quarantine efficacy at time t (fiber formula):
-  #   etu_eff(t) = etu_efficacy_baseline + (1 - etu_efficacy_baseline) * ipc_index(t)
-  #   hosp_quar_eff(t) = prop_etu(t) * etu_eff(t) + (1 - prop_etu(t)) * ipc_index(t)
-  # Falls back to non_etu_hospital_efficacy if prop_etu_fn/ipc_index_fn not supplied.
-  compute_hospital_quarantine_eff <- function(t) {
-    if (!is.null(prop_etu_fn) && !is.null(ipc_index_fn)) {
-      p_etu_t   <- resolve_prob(prop_etu_fn,   t)
-      ipc_t     <- resolve_prob(ipc_index_fn,  t)
-      etu_eff_t <- etu_efficacy_baseline + (1 - etu_efficacy_baseline) * ipc_t
-      p_etu_t * etu_eff_t + (1 - p_etu_t) * ipc_t
-    } else {
-      # Fallback: weighted average of ETU and non-ETU efficacy with fixed prop_etu
-      p_etu_t <- if (!is.null(prop_etu_fn)) resolve_prob(prop_etu_fn, t) else 0
-      p_etu_t * etu_efficacy_baseline + (1 - p_etu_t) * non_etu_hospital_efficacy
-    }
-  }
-
-  # Effective PPE efficacy at time t:
-  #   eff_ppe(t) = ppe_coverage(t) * ppe_efficacy_hcw
-  compute_ppe_eff <- function(t) {
-    cov_t <- resolve_prob(ppe_coverage_fn, t)
-    cov_t * ppe_efficacy_hcw
-  }
-
-  # Community p_inf used as-is (no frequency accumulation)
-  # User supplies the intended per-edge transmission probability directly
-  p_eff_close_daily    <- p_inf_community_close_daily
-  p_eff_close_weekly   <- p_inf_community_close_weekly
-  p_eff_close_monthly  <- p_inf_community_close_monthly
-  p_eff_phys_daily     <- p_inf_community_physical_daily
-  p_eff_phys_weekly    <- p_inf_community_physical_weekly
-  p_eff_phys_monthly   <- p_inf_community_physical_monthly
+  # Pre-compute 3-week effective p_inf per stratum (once at start)
+  p_eff_close_daily    <- p_cumul(p_inf_community_close_daily,    21)
+  p_eff_close_weekly   <- p_cumul(p_inf_community_close_weekly,   3)
+  p_eff_close_monthly  <- p_cumul(p_inf_community_close_monthly,  0.75)
+  p_eff_phys_daily     <- p_cumul(p_inf_community_physical_daily,   21)
+  p_eff_phys_weekly    <- p_cumul(p_inf_community_physical_weekly,  3)
+  p_eff_phys_monthly   <- p_cumul(p_inf_community_physical_monthly, 0.75)
 
   # PK/PD drug efficacy (one-compartment PK + Emax PD)
   compute_drug_eff <- function(t_current, t_treated, pd_params, pk_params) {
@@ -264,18 +227,11 @@ ebola_network_sim <- function(
                                 generation_val, contact_type_val) {
     t_onset <- t_inf + incubation_period_fn(1)
 
-    # Hospitalisation probability: time-varying override takes precedence
-    p_hosp_base <- if (isTRUE(v_is_hcw[idx])) prob_hospitalised_hcw else prob_hospitalised_genPop
-    p_hosp_tv   <- if (!isTRUE(v_is_hcw[idx]) && !is.null(prob_hospitalised_genPop_fn))
-      prob_hospitalised_genPop_fn else p_hosp_base
-    p_hosp_t    <- resolve_prob(p_hosp_tv, t_onset)
-    is_hosp     <- rbinom(1, 1, p_hosp_t) == 1L
-
-    # Hospitalisation delay: raw draw × time-varying delay factor (fiber pattern)
-    t_hosp <- if (is_hosp) {
-      delay_factor_t <- resolve_tv(hospitalisation_delay_factor, t_onset)
-      t_onset + onset_to_hospitalisation_fn(1) * delay_factor_t
-    } else NA_real_
+    p_hosp_t <- resolve_tv(
+      if (isTRUE(v_is_hcw[idx])) prob_hospitalised_hcw else prob_hospitalised_genPop,
+      t_onset)
+    is_hosp <- rbinom(1, 1, p_hosp_t) == 1L
+    t_hosp  <- if (is_hosp) t_onset + onset_to_hospitalisation_fn(1) else NA_real_
 
     eff_death        <- drug_eff_death * (treated[idx] == 1L)
     p_death_comm_eff <- prob_death_comm * (1 - eff_death)
@@ -300,16 +256,9 @@ ebola_network_sim <- function(
       outcome_loc <- "community"
     }
 
-    # Funeral safety: community vs hospital death, time-varying (fiber pattern)
     funeral_uns <- NA
     if (is_death) {
-      if (outcome_loc == "hospital" && !is.null(p_unsafe_funeral_hosp_fn)) {
-        p_unsafe_t <- resolve_prob(p_unsafe_funeral_hosp_fn, t_outcome)
-      } else if (outcome_loc == "community" && !is.null(p_unsafe_funeral_comm_fn)) {
-        p_unsafe_t <- resolve_prob(p_unsafe_funeral_comm_fn, t_outcome)
-      } else {
-        p_unsafe_t <- resolve_prob(p_unsafe_funeral, t_outcome)
-      }
+      p_unsafe_t  <- resolve_tv(p_unsafe_funeral, t_outcome)
       funeral_uns <- rbinom(1, 1, p_unsafe_t) == 1L
     }
 
@@ -385,9 +334,7 @@ ebola_network_sim <- function(
   n_cumul_infected <- length(seed_idx)
   stop_reason      <- "extinction"
 
-  # Resolve funeral generation time function (fallback to community Tg if not supplied)
-  funeral_Tg_fn <- if (!is.null(funeral_generation_time_fn))
-    funeral_generation_time_fn else generation_time_fn
+  # ── Gate check ────────────────────────────────────────────────────────────
   passes_gates <- function(idx, nbr_id, t_inf_nbr, p_inf, eff_trans_src) {
     if (rbinom(1, 1, p_inf) == 0L) return(FALSE)
     if (eff_trans_src > 0 && rbinom(1, 1, eff_trans_src) == 1L) return(FALSE)
@@ -433,8 +380,8 @@ ebola_network_sim <- function(
     if (monitoring_console) {
       event_count <- event_count + 1L
       if (event_count %% 100L == 0L)
-        message(sprintf("T = %4f  [event %6d] active=%4d | total=%6d",
-                        t_earliest, event_count, queue_size(), n_cumul_infected))
+        message(sprintf("  [event %6d] active=%4d | total=%6d",
+                        event_count, queue_size(), n_cumul_infected))
     }
 
     if (n_cumul_infected >= max_infected) { stop_reason <- "max_infected"; break }
@@ -554,13 +501,11 @@ ebola_network_sim <- function(
     )
 
     # HCW pre-admission hospital contacts
-    # PPE efficacy resolved at transmission time: ppe_coverage(t) * ppe_efficacy_hcw
     if (is_hcw_idx && length(hcw_nbrs[[idx]]) > 0 &&
         rbinom(1, 1, prob_hospital_cond_hcw_preAdm) == 1L) {
-      ppe_eff_t <- compute_ppe_eff(t_inf_idx)
       phase1_groups[[length(phase1_groups) + 1L]] <- list(
         nbrs  = hcw_nbrs[[idx]],
-        p_inf = p_inf_hcw_to_hcw * (1 - ppe_eff_t),
+        p_inf = p_inf_hcw_to_hcw * (1 - ppe_efficacy_hcw),
         ctype = 4L)
     }
 
@@ -595,10 +540,6 @@ ebola_network_sim <- function(
         if (status[nbr_id] != 1L) next
         t_inf_nbr <- t_hosp_idx + generation_time_fn(1)
         if (t_inf_nbr > t_out_idx) next
-        # Hospital quarantine thinning (fiber pattern):
-        # ETU isolation + IPC maturity reduce post-admission transmission
-        hosp_quar_eff_t <- compute_hospital_quarantine_eff(t_inf_nbr)
-        if (hosp_quar_eff_t > 0 && rbinom(1, 1, hosp_quar_eff_t) == 1L) next
         if (!passes_gates(idx, nbr_id, t_inf_nbr, p_inf_p2, eff_trans_src)) next
 
         # HCW PEP on exposure
@@ -680,7 +621,7 @@ ebola_network_sim <- function(
 
       for (nbr_id in hh_att) {
         if (status[nbr_id] != 1L) next
-        t_inf_nbr <- t_out_idx + funeral_Tg_fn(1)
+        t_inf_nbr <- t_out_idx + generation_time_fn(1)
         if (!passes_gates(idx, nbr_id, t_out_idx, p_inf_f_hh, eff_trans_src)) next
         infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, 5L)
         enqueue(nbr_id, t_inf_nbr)
@@ -689,7 +630,7 @@ ebola_network_sim <- function(
 
       for (nbr_id in all_comm_att) {
         if (status[nbr_id] != 1L) next
-        t_inf_nbr <- t_out_idx + funeral_Tg_fn(1)
+        t_inf_nbr <- t_out_idx + generation_time_fn(1)
         if (!passes_gates(idx, nbr_id, t_out_idx, p_inf_f_comm, eff_trans_src)) next
         infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, 6L)
         enqueue(nbr_id, t_inf_nbr)

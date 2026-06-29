@@ -18,7 +18,7 @@ library(patchwork)
 case_tag      <- "case1_1M"
 index_case_id <- 42L          # NULL = random
 sim_seed      <- 42L
-max_time      <- 500
+max_time      <- 600
 max_infected  <- Inf
 
 network_dir <- "output/network"
@@ -99,17 +99,17 @@ p_inf_community_close_daily      <- 0.00
 p_inf_community_close_weekly     <- 0.00
 p_inf_community_close_monthly    <- 0.00
 
-p_inf_community_physical_daily   <- 0.01
-p_inf_community_physical_weekly  <- 0.01
-p_inf_community_physical_monthly <- 0.01
+p_inf_community_physical_daily   <- 0.055
+p_inf_community_physical_weekly  <- 0.02
+p_inf_community_physical_monthly <- 0.005
 
 p_inf_hcw_to_hcw                 <- 0.02
 p_inf_patient_to_hcw             <- 0.02
 
-funeral_avg                      <- 20
-funeral_k                        <- 0.30   # fiber: overdisp_offspring_funeral=0.30
+funeral_avg                      <- 15
+funeral_k                        <- 0.1   # fiber: overdisp_offspring_funeral=0.30
 p_unsafe_funeral                 <- 0.50   # fallback scalar (overridden by TV comm/hosp fns)
-p_inf_funeral_household          <- 0.15
+p_inf_funeral_household          <- 0.1
 p_inf_funeral_community          <- 0.1
 funeral_unsafe_multiplier        <- 1.0
 funeral_safe_multiplier          <- 0.20   # fiber: 1 - safe_funeral_efficacy = 1 - 0.80 = 0.20
@@ -416,5 +416,72 @@ out_fig <- file.path(fig_dir,
                              ifelse(is.null(index_case_id),"rand",index_case_id)))
 ggsave(out_fig, plot = p_combined, width = 12, height = 10, dpi = 150)
 cat(sprintf("\nSaved: %s\n", out_fig))
+
+# ==============================================================================
+# [Section 7] Weekly incident deaths
+# ==============================================================================
+
+death_df <- inf_df %>%
+  filter(isTRUE(outcome_death) | outcome_death == TRUE) %>%
+  filter(!is.na(time_outcome)) %>%
+  mutate(
+    week      = floor(time_outcome / 7),
+    is_hcw    = isTRUE(is_hcw) | is_hcw == TRUE,
+    death_loc = outcome_location
+  )
+
+weekly_deaths <- death_df %>%
+  group_by(week) %>%
+  summarise(
+    n_total   = n(),
+    n_hcw     = sum(is_hcw, na.rm = TRUE),
+    n_genpop  = n_total - n_hcw,
+    n_comm    = sum(death_loc == "community", na.rm = TRUE),
+    n_hosp    = sum(death_loc == "hospital",  na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  mutate(week_start = week * 7)
+
+# Stacked bar: genPop community / genPop hospital / HCW
+weekly_long <- weekly_deaths %>%
+  select(week_start, n_comm, n_hosp, n_hcw) %>%
+  tidyr::pivot_longer(
+    cols      = c(n_comm, n_hosp, n_hcw),
+    names_to  = "group",
+    values_to = "deaths"
+  ) %>%
+  mutate(group = factor(group,
+                        levels = c("n_hcw", "n_hosp", "n_comm"),
+                        labels = c("HCW", "Hospital (genPop)", "Community (genPop)")))
+
+p_weekly_death <- ggplot(weekly_long,
+                         aes(x = week_start, y = deaths, fill = group)) +
+  geom_col(alpha = 0.85, width = 6) +
+  scale_fill_manual(
+    values = c("HCW"                = "#993C1D",
+               "Hospital (genPop)"  = "#E07B39",
+               "Community (genPop)" = "#185FA5"),
+    name = NULL
+  ) +
+  labs(
+    title    = sprintf("%s — Weekly incident deaths", case_tag),
+    subtitle = sprintf("Total deaths: %d | HCW: %d (%.1f%%)",
+                       sum(weekly_deaths$n_total),
+                       sum(weekly_deaths$n_hcw),
+                       100 * sum(weekly_deaths$n_hcw) / max(sum(weekly_deaths$n_total), 1)),
+    x = "Day (week start)", y = "Deaths per week"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title      = element_text(size = 12, face = "bold"),
+    plot.subtitle   = element_text(size = 9,  color = "grey40"),
+    legend.position = "top"
+  )
+
+out_death <- file.path(fig_dir,
+                       sprintf("%s_seed%s_weekly_deaths.png", case_tag,
+                               ifelse(is.null(index_case_id), "rand", index_case_id)))
+ggsave(out_death, plot = p_weekly_death, width = 10, height = 5, dpi = 150)
+cat(sprintf("Saved: %s\n", out_death))
 
 invisible(result)

@@ -1,44 +1,8 @@
 # ============================================================
 # Build frequency-stratified 3-week contact matrices for DRC (Congo)
 # and produce visualization figures.
-#
-# Pipeline:
-#   1. Load Prem (Congo) close-contact matrices by location
-#      (home / work / school / other), already symmetrized.
-#   2. Compute age- and location-specific frequency proportions
-#      from POLYMOD frequency_multi (daily / weekly / monthly+).
-#   3. Apply frequency-specific multipliers to Prem matrices ->
-#      three separate 3-week close contact matrices per location:
-#        - prem_3wk_daily    : contacts occurring daily
-#        - prem_3wk_weekly   : contacts occurring weekly
-#        - prem_3wk_monthly  : contacts occurring monthly or less
-#      Each is also re-aggregated into "community".
-#   4. Compute location-specific physical/total contact ratio
-#      (16x16, from POLYMOD raw data, manually symmetrized).
-#   5. Rescale POLYMOD ratio to Mousa et al. LIC/LMIC targets
-#      via logit-scale binary search (arithmetic mean matched)
-#      -> blended physical ratio.
-#   6. Apply blended physical ratio to each frequency-stratified
-#      3-week close contact matrix -> physical contact matrices.
-#   7. Save all matrices to output/MPMmat/.
-#   8. Visualize:
-#      (a) 1x3 heatmap: Prem close contact (home / work / other)
-#      (b) 1x3 heatmap: blended physical ratio (work / school / other)
-#      (c) 1x3 heatmap: household contact structure
-#          (Prem close | physical ratio | Prem x ratio)
-#      (d) 2x3 bar chart: age-stratified contact-slots and unique
-#          contacts by frequency stratum (work / school / other)
-#      (e) Population-weighted Panel A/B summary bar chart
-#          (work / school / other)
-#
-# Locations mapping: POLYMOD (cnt_home, cnt_work, cnt_school,
-# cnt_transport, cnt_leisure, cnt_otherplace) -> Prem (home, work,
-# school, other), where Prem "other" = POLYMOD transport+leisure+otherplace
 # ============================================================
 
-# ------------------------------------------------------------
-# Libraries
-# ------------------------------------------------------------
 library(socialmixr)
 library(data.table)
 library(readxl)
@@ -47,9 +11,6 @@ library(tidyr)
 library(terra)
 library(cowplot)
 
-# ------------------------------------------------------------
-# Output directories
-# ------------------------------------------------------------
 dir.create("figure/MPMmat", recursive = TRUE, showWarnings = FALSE)
 dir.create("output/MPMmat", recursive = TRUE, showWarnings = FALSE)
 
@@ -68,9 +29,6 @@ age_breaks <- c(seq(0, 75, by = 5), Inf)
 locations  <- c("home", "work", "school", "other")
 loc_labels <- c("Home", "Work", "School", "Other")
 
-# Frequency strata: POLYMOD frequency_multi codes
-#   1=daily, 2=weekly, 3=monthly, 4=less_often, 5=first_time
-# "monthly" absorbs codes 3/4/5
 freq_strata <- list(
   daily   = 1L,
   weekly  = 2L,
@@ -82,18 +40,12 @@ freq_category_labels <- c(
   `4` = "less_often", `5` = "first_time"
 )
 
-# Per-stratum 3-week multipliers
-# daily  : 21 occurrences in 21 days -> weight = 1 (per-day rate unchanged)
-# weekly : 3 occurrences in 21 days  -> weight = 3
-# monthly: <1 occurrence             -> weight = 3/4
 freq_stratum_weights <- c(daily = 1, weekly = 3, monthly = 3/4)
 
-# Mousa et al. (eLife 2021), Appendix 2-figure 6(A)
-# LIC/LMIC physical contact proportions by location
 mousa_lic_physical <- c(
   home      = 0.690,
   school    = 0.755,
-  community = 0.620,  # maps to Prem "other"
+  community = 0.620,
   work      = 0.565
 )
 
@@ -140,7 +92,6 @@ pm_merged <- merge(
 pm_merged[, age_group := cut(part_age_exact, breaks = age_breaks,
                              labels = age_labels, right = FALSE)]
 
-# Mapping: Prem location -> POLYMOD location column(s)
 prem_to_polymod_loc <- list(
   home   = "cnt_home",
   work   = "cnt_work",
@@ -148,7 +99,6 @@ prem_to_polymod_loc <- list(
   other  = c("cnt_transport", "cnt_leisure", "cnt_otherplace")
 )
 
-# Diagnostic: raw frequency proportions by age group and location
 compute_frequency_proportions_by_age <- function(loc_cols, loc_name) {
   is_loc <- rowSums(pm_merged[, ..loc_cols, drop = FALSE]) > 0
   sub <- pm_merged[is_loc]
@@ -184,8 +134,6 @@ for (loc in locations) {
   print(sub_diag, row.names = FALSE)
 }
 
-# Stratum proportions per age x location
-# stratum_props[[location]][[stratum]] = 16-vector of proportions
 compute_stratum_proportions_by_age <- function(loc_cols) {
   is_loc <- rowSums(pm_merged[, ..loc_cols, drop = FALSE]) > 0
   sub <- pm_merged[is_loc]
@@ -201,7 +149,6 @@ compute_stratum_proportions_by_age <- function(loc_cols) {
 
 stratum_props <- lapply(prem_to_polymod_loc, compute_stratum_proportions_by_age)
 
-# Impute NA with location-level stratum mean
 for (loc in names(stratum_props)) {
   for (st in names(freq_strata)) {
     v <- stratum_props[[loc]][[st]]
@@ -212,9 +159,6 @@ for (loc in names(stratum_props)) {
 
 # ------------------------------------------------------------
 # Step 3: Build frequency-stratified 3-week close contact matrices
-#
-# prem_3wk_<s>[[l]] = Prem[[l]] * proportion_in_stratum(s) * weight(s)
-# Symmetrized via (row-perspective + col-perspective) / 2.
 # ------------------------------------------------------------
 apply_stratum_matrix <- function(mat, prop_vec, stratum_weight) {
   scale_row <- prop_vec * stratum_weight
@@ -262,9 +206,6 @@ polymod_for_ratio          <- polymod
 polymod_for_ratio$contacts <- pm_for_ratio
 
 compute_physical_ratio_single <- function(loc_col) {
-  # symmetric = FALSE: avoid socialmixr's population-weighted symmetrization,
-  # which distorts sparse age cells (e.g. 75+ in work/school).
-  # Manual (matrix + transpose) / 2 symmetrization used instead.
   cm_total_raw <- contact_matrix(
     polymod_for_ratio,
     age.limits = age_breaks[-length(age_breaks)],
@@ -308,10 +249,6 @@ ratio_other  <- get_ratio("other")
 
 # ------------------------------------------------------------
 # Step 5: Blend POLYMOD ratio shape with Mousa LIC/LMIC level
-#
-# Logit-scale binary search: finds offset such that the arithmetic
-# mean of nonzero cells exactly matches the Mousa LIC/LMIC target.
-# Guarantees all values remain in (0, 1).
 # ------------------------------------------------------------
 logit     <- function(p) log(p / (1 - p))
 inv_logit <- function(x) exp(x) / (1 + exp(x))
@@ -354,7 +291,6 @@ for (loc in names(blended_ratio)) {
 
 # ------------------------------------------------------------
 # Step 6: Apply blended ratio -> frequency-stratified physical matrices
-# blended_ratio is frequency-agnostic; same ratio applied per stratum.
 # ------------------------------------------------------------
 apply_physical_ratio <- function(close_list) {
   phys_list <- list()
@@ -372,18 +308,7 @@ prem_3wk_monthly_physical <- apply_physical_ratio(prem_3wk_monthly)
 
 # ------------------------------------------------------------
 # Step 7: Compute prem_unique and stratum allocation probabilities
-#
-# prem_unique = sum of three frequency-stratified unique contact matrices.
-# Used in p7 network build: sample all contacts once from prem_unique,
-# then allocate each edge to daily/weekly/monthly via Multinomial,
-# and assign is_physical flag via Bernoulli(blended_ratio).
-# This eliminates cross-stratum duplicate edges by construction.
-#
-# stratum_probs_comm: 16x3 matrix of [p_daily, p_weekly, p_monthly]
-# per participant age group, for Multinomial allocation in C++.
 # ------------------------------------------------------------
-
-# Community unique contact matrix (sum of three strata)
 prem_unique_community <- prem_3wk_daily$community +
   prem_3wk_weekly$community +
   prem_3wk_monthly$community
@@ -393,10 +318,6 @@ message(sprintf("  %.2f - %.2f",
                 min(rowSums(prem_unique_community)),
                 max(rowSums(prem_unique_community))))
 
-# Community stratum allocation probabilities per age group (16x3 matrix)
-# Row i: [p_daily_i, p_weekly_i, p_monthly_i] — sums to 1 per row
-# Derived from stratum_props (community = mean of work/school/other,
-# weighted by contact volume in prem_unique_community)
 stratum_props_comm <- list(
   daily   = (stratum_props$work$daily   * rowSums(prem_3wk_daily$work)   +
                stratum_props$school$daily * rowSums(prem_3wk_daily$school) +
@@ -412,13 +333,11 @@ stratum_props_comm <- list(
     (rowSums(prem_unique_community) + 1e-12)
 )
 
-# Verify: should sum to ~1 per age group
 stratum_check <- stratum_props_comm$daily + stratum_props_comm$weekly +
   stratum_props_comm$monthly
 message(sprintf("  Stratum prob sum range: [%.4f, %.4f]",
                 min(stratum_check), max(stratum_check)))
 
-# 16x3 matrix for C++ (rows = age groups, cols = daily/weekly/monthly)
 stratum_prob_mat <- cbind(
   daily   = stratum_props_comm$daily,
   weekly  = stratum_props_comm$weekly,
@@ -426,34 +345,14 @@ stratum_prob_mat <- cbind(
 )
 rownames(stratum_prob_mat) <- age_labels
 
-# Community blended physical ratio (contact-volume weighted mean)
-blended_ratio_comm <- (blended_ratio$work   * rowSums(prem_unique_community) +
-                         blended_ratio$school * rowSums(prem_unique_community) +
-                         blended_ratio$other  * rowSums(prem_unique_community)) /
-  (3 * rowSums(prem_unique_community) + 1e-12)
-# Simpler: unweighted mean across three locations
 blended_ratio_comm <- (blended_ratio$work + blended_ratio$school + blended_ratio$other) / 3
 
 message(sprintf("  blended_ratio_comm mean (nonzero): %.4f",
                 mean(blended_ratio_comm[blended_ratio_comm > 0])))
 
-# ------------------------------------------------------------
-# Household close-only and physical-only matrices
-# Used in simulation for age-group-specific household transmission:
-#   p_eff = p_inf_household_close    * close_only_home[age_i, age_j]
-#         + p_inf_household_physical * phys_only_home[age_i, age_j]
-#
-# close_only_home: Prem home daily rate × (1 - blended_ratio$home)
-#   → contacts that are close but NOT physical
-# phys_only_home:  Prem home daily rate × blended_ratio$home
-#   → contacts that are physical (subset of close)
-# Both use raw Prem daily rate (no rarefaction) since household
-# contacts are effectively permanent relationships.
-# ------------------------------------------------------------
 close_only_home <- prem_mats$home * (1 - blended_ratio$home)
 phys_only_home  <- prem_mats$home * blended_ratio$home
 
-# Symmetrize
 close_only_home <- (close_only_home + t(close_only_home)) / 2
 phys_only_home  <- (phys_only_home  + t(phys_only_home))  / 2
 
@@ -471,22 +370,18 @@ message(sprintf("  sum check (should equal prem_mats$home rowSums): %.3f - %.3f"
 # ------------------------------------------------------------
 saveRDS(
   list(
-    # Frequency-stratified matrices (retained for diagnostics/visualization)
     close_3wk_daily      = prem_3wk_daily,
     close_3wk_weekly     = prem_3wk_weekly,
     close_3wk_monthly    = prem_3wk_monthly,
     physical_3wk_daily   = prem_3wk_daily_physical,
     physical_3wk_weekly  = prem_3wk_weekly_physical,
     physical_3wk_monthly = prem_3wk_monthly_physical,
-    # Network build inputs (used in p7 C++ edge builder)
-    prem_unique_community = prem_unique_community,  # 16x16 unique contact matrix
-    stratum_prob_mat      = stratum_prob_mat,        # 16x3 stratum allocation probs
-    blended_ratio_comm    = blended_ratio_comm,      # 16x16 physical ratio (community)
-    blended_ratio         = blended_ratio,           # per-location blended ratios
-    # Household simulation inputs
-    close_only_home       = close_only_home,  # 16x16: Prem home × (1-phys_ratio)
-    phys_only_home        = phys_only_home,   # 16x16: Prem home × phys_ratio
-    # Supporting objects
+    prem_unique_community = prem_unique_community,
+    stratum_prob_mat      = stratum_prob_mat,
+    blended_ratio_comm    = blended_ratio_comm,
+    blended_ratio         = blended_ratio,
+    close_only_home       = close_only_home,
+    phys_only_home        = phys_only_home,
     stratum_props                   = stratum_props,
     frequency_proportion_diagnostic = frequency_proportion_diagnostic
   ),
@@ -498,7 +393,6 @@ cat("\nSaved: output/MPMmat/DRC_network_input_matrices.rds\n")
 # Step 8: Visualization
 # ============================================================
 
-# --- Shared helper: 16x16 matrix -> long data.frame ---
 mat_to_long <- function(mat, age_labs) {
   df <- as.data.frame(mat)
   colnames(df) <- age_labs
@@ -507,10 +401,24 @@ mat_to_long <- function(mat, age_labs) {
                names_to = "contact", values_to = "value")
 }
 
-# --- Shared helper: build one heatmap tile ---
-make_heatmap_tile <- function(mat, title, low_col, high_col,
+# Helper: add panel label outside the plot area using cowplot
+# Wraps a ggplot (or grob) in an ggdraw canvas with a label drawn
+# at the top-left corner, outside the plot region.
+add_panel_label <- function(plot_obj, label,
+                            x = 0.01, y = 0.99,
+                            size = 12, fontface = "bold") {
+  ggdraw(plot_obj) +
+    draw_label(label, x = x, y = y,
+               hjust = 0, vjust = 1,
+               fontface = fontface, size = size)
+}
+
+# Shared heatmap builder — no titles, no internal annotations
+make_heatmap_tile <- function(mat,
+                              col_title,
+                              low_col, high_col,
                               fill_label, scale_limits,
-                              show_y = FALSE, subtitle = NULL) {
+                              show_y = FALSE) {
   df <- mat_to_long(mat, age_labels)
   df$participant <- factor(df$participant, levels = age_labels)
   df$contact     <- factor(df$contact,     levels = age_labels)
@@ -521,19 +429,19 @@ make_heatmap_tile <- function(mat, title, low_col, high_col,
                         limits = scale_limits, na.value = "grey90",
                         name = fill_label) +
     scale_x_discrete(guide = guide_axis(angle = 90)) +
-    labs(title    = title,
-         subtitle = subtitle,
-         x = "Contact age",
-         y = if (show_y) "Participant age" else NULL) +
+    labs(
+      title = col_title,
+      x     = "Contact age",
+      y     = if (show_y) "Participant age" else NULL
+    ) +
     theme_minimal(base_size = 8) +
     theme(
-      plot.title        = element_text(size = 9, face = "bold", hjust = 0.5),
-      plot.subtitle     = element_text(size = 6, hjust = 0.5, color = "grey40"),
-      axis.text         = element_text(size = 5),
+      plot.title        = element_text(size = 8, face = "bold", hjust = 0.5),
+      axis.text         = element_text(size = 7),
       axis.title        = element_text(size = 7),
       legend.position   = "right",
-      legend.title      = element_text(size = 6),
-      legend.text       = element_text(size = 5),
+      legend.title      = element_text(size = 7),
+      legend.text       = element_text(size = 7),
       legend.key.height = unit(0.45, "cm"),
       panel.grid        = element_blank(),
       plot.margin       = margin(3, 4, 3, 4)
@@ -541,8 +449,7 @@ make_heatmap_tile <- function(mat, title, low_col, high_col,
 }
 
 # ----------------------------------------------------------
-# Plot (a): 1x3 heatmap — Prem close contact
-#           home / work / other
+# Plot (a): 1×3 heatmap — Prem close contact  [Panel A]
 # ----------------------------------------------------------
 plot_locs_a       <- c("home", "work", "other")
 plot_loc_labels_a <- c("Home", "Work", "Other")
@@ -553,7 +460,7 @@ shared_max_a <- max(sapply(plot_locs_a,
 panels_a <- mapply(function(loc, llab, i) {
   make_heatmap_tile(
     prem_mats[[loc]],
-    title        = llab,
+    col_title    = llab,
     low_col      = "#FAEEDA", high_col = "#BA7517",
     fill_label   = "contacts/day",
     scale_limits = c(0, shared_max_a),
@@ -562,30 +469,22 @@ panels_a <- mapply(function(loc, llab, i) {
 }, plot_locs_a, plot_loc_labels_a, seq_along(plot_locs_a), SIMPLIFY = FALSE)
 
 grid_a <- plot_grid(plotlist = panels_a, nrow = 1, ncol = 3)
-title_a <- ggdraw() +
-  draw_label("Prem close contact matrices — DRC (home / work / other)",
-             fontface = "bold", size = 11, x = 0.5, hjust = 0.5)
 
 ggsave("figure/MPMmat/DRC_prem_close_heatmap_1x3.png",
-       plot_grid(title_a, grid_a, ncol = 1, rel_heights = c(0.08, 1)),
-       width = 10, height = 4.5, dpi = 300)
+       # add_panel_label(grid_a, "A"),
+       width = 11, height = 3.3, dpi = 300)
 message("Saved: figure/MPMmat/DRC_prem_close_heatmap_1x3.png")
 
 # ----------------------------------------------------------
-# Plot (b): 1x3 heatmap — blended physical ratio
-#           work / school / other
+# Plot (b): 1×3 heatmap — blended physical ratio  [Panel B]
 # ----------------------------------------------------------
 plot_locs_b       <- c("work", "school", "other")
 plot_loc_labels_b <- c("Work", "School", "Other")
-mousa_targets     <- c(work = 0.565, school = 0.755, other = 0.620)
 
 panels_b <- mapply(function(loc, llab, i) {
-  achieved <- mean(blended_ratio[[loc]][blended_ratio[[loc]] > 0])
   make_heatmap_tile(
     blended_ratio[[loc]],
-    title        = llab,
-    subtitle     = sprintf("target %.3f  |  achieved %.3f",
-                           mousa_targets[loc], achieved),
+    col_title    = llab,
     low_col      = "#E6F1FB", high_col = "#0C447C",
     fill_label   = "proportion",
     scale_limits = c(0, 1),
@@ -594,22 +493,14 @@ panels_b <- mapply(function(loc, llab, i) {
 }, plot_locs_b, plot_loc_labels_b, seq_along(plot_locs_b), SIMPLIFY = FALSE)
 
 grid_b <- plot_grid(plotlist = panels_b, nrow = 1, ncol = 3)
-title_b <- ggdraw() +
-  draw_label("Blended physical contact ratio — DRC (work / school / other)",
-             fontface = "bold", size = 11, x = 0.5, hjust = 0.5)
-subtitle_b <- ggdraw() +
-  draw_label("POLYMOD shape rescaled to Mousa et al. LIC/LMIC targets via logit-scale binary search",
-             size = 8, color = "grey40", x = 0.5, hjust = 0.5)
 
 ggsave("figure/MPMmat/DRC_blended_ratio_heatmap_1x3.png",
-       plot_grid(title_b, subtitle_b, grid_b,
-                 ncol = 1, rel_heights = c(0.07, 0.05, 1)),
+       add_panel_label(grid_b, "B"),
        width = 10, height = 4.5, dpi = 300)
 message("Saved: figure/MPMmat/DRC_blended_ratio_heatmap_1x3.png")
 
 # ----------------------------------------------------------
-# Plot (c): 1x3 heatmap — household contact structure
-#   Col 1: Prem close  |  Col 2: physical ratio  |  Col 3: Prem x ratio
+# Plot (c): 1×3 heatmap — household contact structure  [Panel C]
 # ----------------------------------------------------------
 home_physical <- {
   raw <- prem_mats$home * blended_ratio$home
@@ -618,7 +509,7 @@ home_physical <- {
 
 p_c1 <- make_heatmap_tile(
   prem_mats$home,
-  title        = "Prem close contact (daily rate)",
+  col_title    = "Close contact",
   low_col      = "#FAEEDA", high_col = "#BA7517",
   fill_label   = "contacts/day",
   scale_limits = c(0, max(prem_mats$home, na.rm = TRUE)),
@@ -626,7 +517,7 @@ p_c1 <- make_heatmap_tile(
 )
 p_c2 <- make_heatmap_tile(
   blended_ratio$home,
-  title        = "Physical contact ratio",
+  col_title    = "Physical contact ratio",
   low_col      = "#E6F1FB", high_col = "#0C447C",
   fill_label   = "proportion",
   scale_limits = c(0, 1),
@@ -634,38 +525,28 @@ p_c2 <- make_heatmap_tile(
 )
 p_c3 <- make_heatmap_tile(
   home_physical,
-  title        = "Physical contact (Prem \u00d7 ratio)",
+  col_title    = "Physical contact",
   low_col      = "#FAEEDA", high_col = "#BA7517",
   fill_label   = "contacts/day",
-  scale_limits = c(0, max(home_physical, na.rm = TRUE)),
+  scale_limits = c(0, max(prem_mats$home, na.rm = TRUE)),
   show_y       = FALSE
 )
 
-title_c <- ggdraw() +
-  draw_label("Household contact structure — DRC",
-             fontface = "bold", size = 11, x = 0.5, hjust = 0.5)
-subtitle_c <- ggdraw() +
-  draw_label("Left: Prem close contact  |  Centre: blended physical ratio  |  Right: physical contact",
-             size = 8, color = "grey40", x = 0.5, hjust = 0.5)
+grid_c <- plot_grid(p_c1, p_c2, p_c3, nrow = 1)
 
 ggsave("figure/MPMmat/DRC_home_heatmap_1x3.png",
-       plot_grid(title_c, subtitle_c,
-                 plot_grid(p_c1, p_c2, p_c3, nrow = 1),
-                 ncol = 1, rel_heights = c(0.07, 0.05, 1)),
-       width = 11, height = 4.5, dpi = 300)
+       # add_panel_label(grid_c, "C"),
+       width = 11, height = 3.3, dpi = 300)
 message("Saved: figure/MPMmat/DRC_home_heatmap_1x3.png")
 
 # ----------------------------------------------------------
-# Plot (d): 2x3 age-stratified bar chart
-#   Row 1: contact-slots (x21)  |  Row 2: unique contacts (rarefied)
-#   Cols : work / school / other
+# Plot (d): 2×3 age-stratified bar chart  [Panel D]
 # ----------------------------------------------------------
 plot_locs_d       <- c("work", "school", "other")
 plot_loc_labels_d <- c("Work", "School", "Other")
 
 freq_colors <- c("Daily" = "#993C1D", "Weekly" = "#0F6E56", "Monthly+" = "#185FA5")
 
-# Load WorldPop population weights
 worldpop_age_map <- list(
   "0-4" = c("00","01"), "5-9" = c("05"), "10-14" = c("10"),
   "15-19" = c("15"), "20-24" = c("20"), "25-29" = c("25"),
@@ -701,7 +582,7 @@ get_freq_props_age <- function(loc_name, ag) {
        p_monthly_plus = row$monthly + row$less_often + row$first_time)
 }
 
-build_age_df <- function(loc, panel_label) {
+build_age_df <- function(loc, row_label) {
   rows <- lapply(age_labels, function(ag) {
     w           <- pop_weights[ag]
     daily_rate  <- rowSums(prem_mats[[loc]])[which(age_labels == ag)]
@@ -709,7 +590,7 @@ build_age_df <- function(loc, panel_label) {
     fp          <- get_freq_props_age(loc, ag)
     if (is.na(fp$p_daily)) return(NULL)
 
-    if (panel_label == "A") {
+    if (row_label == "A") {
       vals <- c(w * total_slots * fp$p_daily,
                 w * total_slots * fp$p_weekly,
                 w * total_slots * fp$p_monthly_plus)
@@ -725,9 +606,9 @@ build_age_df <- function(loc, panel_label) {
   do.call(rbind, rows)
 }
 
-compute_y_max <- function(panel_label) {
+compute_y_max <- function(row_label) {
   vals <- unlist(lapply(plot_locs_d, function(loc) {
-    df <- build_age_df(loc, panel_label)
+    df <- build_age_df(loc, row_label)
     tapply(df$contacts, df$age_group, sum)
   }))
   max(vals, na.rm = TRUE) * 1.08
@@ -736,22 +617,29 @@ compute_y_max <- function(panel_label) {
 y_max_A <- compute_y_max("A")
 y_max_B <- compute_y_max("B")
 
-make_bar <- function(loc, llab, panel_label, y_max,
-                     show_title = FALSE, show_x = FALSE, show_y_title = FALSE) {
-  df <- build_age_df(loc, panel_label)
+make_bar <- function(loc, llab, row_label,
+                     y_max,
+                     show_col_title = FALSE,
+                     show_x         = FALSE,
+                     show_y_title   = FALSE) {
+  df <- build_age_df(loc, row_label)
   df$age_group <- factor(df$age_group, levels = age_labels)
   df$stratum   <- factor(df$stratum, levels = c("Monthly+", "Weekly", "Daily"))
+
+  y_title <- if (show_y_title) {
+    if (row_label == "A") "Contact-slots (×21)" else "Unique contacts"
+  } else NULL
 
   ggplot(df, aes(x = age_group, y = contacts, fill = stratum)) +
     geom_col(width = 0.8) +
     scale_fill_manual(values = freq_colors, name = "Frequency") +
     scale_y_continuous(expand = expansion(mult = c(0, 0.03)),
                        limits = c(0, y_max)) +
-    labs(title = if (show_title) llab else NULL,
-         x     = if (show_x) "Age group" else NULL,
-         y     = if (show_y_title)
-           ifelse(panel_label == "A", "Contact-slots (×21)", "Unique contacts")
-         else NULL) +
+    labs(
+      title = if (show_col_title) llab else NULL,
+      x     = if (show_x) "Age group" else NULL,
+      y     = y_title
+    ) +
     theme_minimal(base_size = 8) +
     theme(
       plot.title         = element_text(size = 9, face = "bold", hjust = 0.5),
@@ -767,13 +655,17 @@ make_bar <- function(loc, llab, panel_label, y_max,
 }
 
 plots_A <- mapply(function(loc, llab, i)
-  make_bar(loc, llab, "A", y_max_A,
-           show_title = TRUE, show_x = FALSE, show_y_title = (i == 1)),
+  make_bar(loc, llab, row_label = "A", y_max = y_max_A,
+           show_col_title = TRUE,
+           show_x         = FALSE,
+           show_y_title   = (i == 1)),
   plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
 
 plots_B <- mapply(function(loc, llab, i)
-  make_bar(loc, llab, "B", y_max_B,
-           show_title = FALSE, show_x = TRUE, show_y_title = (i == 1)),
+  make_bar(loc, llab, row_label = "B", y_max = y_max_B,
+           show_col_title = FALSE,
+           show_x         = TRUE,
+           show_y_title   = (i == 1)),
   plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
 
 shared_legend <- get_legend(
@@ -786,23 +678,17 @@ grid_d <- plot_grid(
   nrow = 2, ncol = 3, rel_heights = c(1, 1.15)
 )
 
-title_d <- ggdraw() +
-  draw_label("Contact structure by age group — DRC population-weighted (work / school / other)",
-             fontface = "bold", size = 11, x = 0.5, hjust = 0.5)
-subtitle_d <- ggdraw() +
-  draw_label("A: raw contact-slots (daily rate × 21)  |  B: unique contacts (rarefied)",
-             size = 8, color = "grey40", x = 0.5, hjust = 0.5)
+# Attach legend, then add panel label outside
+grid_d_with_legend <- plot_grid(grid_d, shared_legend,
+                                nrow = 1, rel_widths = c(1, 0.1))
 
 ggsave("figure/MPMmat/DRC_rarefaction_AB_by_age_2x3.png",
-       plot_grid(title_d, subtitle_d,
-                 plot_grid(grid_d, shared_legend, nrow = 1, rel_widths = c(1, 0.1)),
-                 ncol = 1, rel_heights = c(0.06, 0.04, 1)),
+       add_panel_label(grid_d_with_legend, "D"),
        width = 12, height = 7, dpi = 300)
 message("Saved: figure/MPMmat/DRC_rarefaction_AB_by_age_2x3.png")
 
 # ----------------------------------------------------------
-# Plot (e): Population-weighted Panel A/B summary bar chart
-#           work / school / other
+# Plot (e): Population-weighted summary bar chart  [Panel E]
 # ----------------------------------------------------------
 plot_locs_e       <- c("work", "school", "other")
 plot_loc_labels_e <- c("Work", "School", "Other")
@@ -826,7 +712,7 @@ panel_df <- do.call(rbind, lapply(seq_along(plot_locs_e), function(i) {
 
   data.frame(
     location = llab,
-    panel    = rep(c("A: Total contact-slots (x21)", "B: Unique contacts (rarefied)"), each = 3),
+    panel    = rep(c("A: Contact-slots (×21)", "B: Unique contacts"), each = 3),
     category = rep(c("Daily", "Weekly", "Monthly+"), 2),
     contacts = c(slot_daily_w, slot_weekly_w, slot_monthly_plus_w,
                  slot_daily_w * (1/21), slot_weekly_w * (1/7),
@@ -837,24 +723,18 @@ panel_df <- do.call(rbind, lapply(seq_along(plot_locs_e), function(i) {
 panel_df$location <- factor(panel_df$location, levels = plot_loc_labels_e)
 panel_df$category <- factor(panel_df$category, levels = c("Monthly+", "Weekly", "Daily"))
 panel_df$panel    <- factor(panel_df$panel,
-                            levels = c("A: Total contact-slots (x21)",
-                                       "B: Unique contacts (rarefied)"))
+                            levels = c("A: Contact-slots (×21)",
+                                       "B: Unique contacts"))
 
 p_e <- ggplot(panel_df, aes(x = location, y = contacts, fill = category)) +
   geom_col(width = 0.65) +
   facet_wrap(~ panel, scales = "fixed", nrow = 1) +
   scale_fill_manual(values = freq_colors, name = "Frequency") +
   scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
-  labs(
-    title    = "Contact structure — DRC population-weighted (work / school / other)",
-    subtitle = "A: raw contact-slots (daily rate x 21)  |  B: unique contacts (rarefied)",
-    x = "Location", y = "Number of contacts"
-  ) +
+  labs(x = "Location", y = "Number of contacts") +
   theme_minimal(base_size = 10) +
   theme(
-    plot.title         = element_text(size = 11, face = "bold", hjust = 0.5),
-    plot.subtitle      = element_text(size = 8,  hjust = 0.5, color = "grey40"),
-    strip.text         = element_text(size = 9,  face = "bold"),
+    strip.text         = element_text(size = 9, face = "bold"),
     axis.text.x        = element_text(size = 9),
     axis.text.y        = element_text(size = 8),
     axis.title         = element_text(size = 9),
@@ -863,5 +743,186 @@ p_e <- ggplot(panel_df, aes(x = location, y = contacts, fill = category)) +
   )
 
 ggsave("figure/MPMmat/DRC_rarefaction_panel_AB_no_home.png",
-       p_e, width = 9, height = 5, dpi = 300)
+       add_panel_label(p_e, "E"),
+       width = 9, height = 5, dpi = 300)
 message("Saved: figure/MPMmat/DRC_rarefaction_panel_AB_no_home.png")
+
+
+# ----------------------------------------------------------
+# Plot (b-2): 1×3 heatmap — POLYMOD 원본 physical ratio
+#             + blended ratio + 차이 (blended - original)
+#             Cols: work / school / other
+# ----------------------------------------------------------
+plot_locs_b2 <- c("work", "school", "other")
+plot_loc_labels_b2 <- c("Work", "School", "Other")
+
+# 원본 POLYMOD ratio (NA -> 0)
+raw_ratio <- list(
+  work   = get_ratio("work"),
+  school = get_ratio("school"),
+  other  = get_ratio("other")
+)
+
+# (1) 원본 POLYMOD ratio 패널
+panels_b2_raw <- mapply(function(loc, llab, i) {
+  make_heatmap_tile(
+    raw_ratio[[loc]],
+    col_title    = llab,
+    low_col      = "#E6F1FB", high_col = "#0C447C",
+    fill_label   = "proportion",
+    scale_limits = c(0, 1),
+    show_y       = (i == 1)
+  )
+}, plot_locs_b2, plot_loc_labels_b2, seq_along(plot_locs_b2), SIMPLIFY = FALSE)
+
+grid_b2_raw <- plot_grid(plotlist = panels_b2_raw, nrow = 1, ncol = 3)
+
+# (2) blended ratio 패널 (기존 Plot b 재활용)
+panels_b2_blended <- mapply(function(loc, llab, i) {
+  make_heatmap_tile(
+    blended_ratio[[loc]],
+    col_title    = llab,
+    low_col      = "#E6F1FB", high_col = "#0C447C",
+    fill_label   = "proportion",
+    scale_limits = c(0, 1),
+    show_y       = (i == 1)
+  )
+}, plot_locs_b2, plot_loc_labels_b2, seq_along(plot_locs_b2), SIMPLIFY = FALSE)
+
+grid_b2_blended <- plot_grid(plotlist = panels_b2_blended, nrow = 1, ncol = 3)
+
+# (3) 차이 패널 (blended - original), 대칭 색상 스케일
+make_diff_tile <- function(mat_diff, col_title, show_y = FALSE) {
+  df <- mat_to_long(mat_diff, age_labels)
+  df$participant <- factor(df$participant, levels = age_labels)
+  df$contact     <- factor(df$contact,     levels = age_labels)
+
+  abs_max <- max(abs(df$value), na.rm = TRUE)
+
+  ggplot(df, aes(x = contact, y = participant, fill = value)) +
+    geom_tile(color = NA) +
+    scale_fill_gradient2(
+      low      = "#2166AC",   # 파란색: blended < original
+      mid      = "white",
+      high     = "#B2182B",   # 빨간색: blended > original
+      midpoint = 0,
+      limits   = c(-abs_max, abs_max),
+      name     = "difference"
+    ) +
+    scale_x_discrete(guide = guide_axis(angle = 90)) +
+    labs(
+      title = col_title,
+      x     = "Contact age",
+      y     = if (show_y) "Participant age" else NULL
+    ) +
+    theme_minimal(base_size = 8) +
+    theme(
+      plot.title        = element_text(size = 9, face = "bold", hjust = 0.5),
+      axis.text         = element_text(size = 5),
+      axis.title        = element_text(size = 7),
+      legend.position   = "right",
+      legend.title      = element_text(size = 6),
+      legend.text       = element_text(size = 5),
+      legend.key.height = unit(0.45, "cm"),
+      panel.grid        = element_blank(),
+      plot.margin       = margin(3, 4, 3, 4)
+    )
+}
+
+panels_b2_diff <- mapply(function(loc, llab, i) {
+  diff_mat <- blended_ratio[[loc]] - raw_ratio[[loc]]
+  make_diff_tile(diff_mat, col_title = llab, show_y = (i == 1))
+}, plot_locs_b2, plot_loc_labels_b2, seq_along(plot_locs_b2), SIMPLIFY = FALSE)
+
+grid_b2_diff <- plot_grid(plotlist = panels_b2_diff, nrow = 1, ncol = 3)
+
+# Row 레이블
+label_raw     <- ggdraw() + draw_label("POLYMOD original", angle = 90, size = 8, fontface = "bold")
+label_blended <- ggdraw() + draw_label("Blended (LIC/LMIC)", angle = 90, size = 8, fontface = "bold")
+label_diff    <- ggdraw() + draw_label("Difference\n(blended − original)", angle = 90, size = 8, fontface = "bold")
+
+row_width <- c(0.04, 1)
+
+row_raw     <- plot_grid(label_raw,     grid_b2_raw,     nrow = 1, rel_widths = row_width)
+row_blended <- plot_grid(label_blended, grid_b2_blended, nrow = 1, rel_widths = row_width)
+row_diff    <- plot_grid(label_diff,    grid_b2_diff,    nrow = 1, rel_widths = row_width)
+
+grid_b2_full <- plot_grid(row_raw, row_blended, row_diff,
+                          ncol = 1, rel_heights = c(1, 1, 1))
+
+ggsave("figure/MPMmat/DRC_physical_ratio_comparison_3x3.png",
+       add_panel_label(grid_b2_full, "B"),
+       width = 11, height = 10, dpi = 300)
+message("Saved: figure/MPMmat/DRC_physical_ratio_comparison_3x3.png")
+
+
+# ----------------------------------------------------------
+# Plot (f): POLYMOD 원본 빈도 비율 — 연령별 stacked bar
+#           work / school / other  (3×1)
+# ----------------------------------------------------------
+plot_locs_f       <- c("work", "school", "other")
+plot_loc_labels_f <- c("Work", "School", "Other")
+
+freq_colors_3 <- c("Daily" = "#993C1D", "Weekly" = "#0F6E56", "Monthly+" = "#185FA5")
+
+# frequency_proportion_diagnostic에서 long format으로 변환
+freq_long <- frequency_proportion_diagnostic %>%
+  mutate(
+    `Monthly+` = monthly + less_often + first_time,
+    Daily      = daily,
+    Weekly     = weekly
+  ) %>%
+  select(age_group, location, Daily, Weekly, `Monthly+`) %>%
+  pivot_longer(cols = c("Daily", "Weekly", "Monthly+"),
+               names_to = "stratum", values_to = "proportion") %>%
+  mutate(
+    age_group = factor(age_group, levels = age_labels),
+    stratum   = factor(stratum, levels = c("Monthly+", "Weekly", "Daily")),
+    location  = case_when(
+      location == "work"   ~ "Work",
+      location == "school" ~ "School",
+      location == "other"  ~ "Other",
+      location == "home"   ~ "Home"
+    )
+  ) %>%
+  filter(location %in% plot_loc_labels_f)
+
+make_freq_bar <- function(loc_label, show_y = FALSE) {
+  df <- freq_long %>% filter(location == loc_label)
+
+  ggplot(df, aes(x = age_group, y = proportion, fill = stratum)) +
+    geom_col(width = 0.8) +
+    scale_fill_manual(values = freq_colors_3, name = "Frequency") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.03)),
+                       limits = c(0, 1),
+                       labels = scales::percent) +
+    labs(
+      title = loc_label,
+      x     = "Age group",
+      y     = if (show_y) "Proportion" else NULL
+    ) +
+    theme_minimal(base_size = 8) +
+    theme(
+      plot.title         = element_text(size = 9, face = "bold", hjust = 0.5),
+      plot.margin        = margin(3, 4, 3, 4),
+      axis.text.x        = element_text(size = 5, angle = 45, hjust = 1),
+      axis.text.y        = element_text(size = 6),
+      axis.title         = element_text(size = 7),
+      legend.position    = "none",
+      panel.grid.major.x = element_blank()
+    )
+}
+
+panels_f <- mapply(function(llab, i)
+  make_freq_bar(llab, show_y = (i == 1)),
+  plot_loc_labels_f, seq_along(plot_loc_labels_f), SIMPLIFY = FALSE)
+
+shared_legend_f <- get_legend(
+  make_freq_bar("Work") + theme(legend.position = "right")
+)
+
+grid_f <- plot_grid(plotlist = panels_f, nrow = 1, ncol = 3)
+
+ggsave("figure/MPMmat/DRC_polymod_freq_proportion_by_age.png",
+       grid_f, width = 11, height = 3.5, dpi = 300)
+message("Saved: figure/MPMmat/DRC_polymod_freq_proportion_by_age.png")

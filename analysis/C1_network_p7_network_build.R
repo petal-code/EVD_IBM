@@ -54,7 +54,7 @@ network_seed <- 42L
 
 # Cases to run — set to NULL to run all three
 # Available: "case1_1M", "case2_Ituri", "case3_Kivu"
-run_cases <- c("case2_Ituri")
+run_cases <- c("case1_1M")
 
 # Bucket boundaries (km) — based on Meta Data for Good mobility bins
 # Bucket 0: same cell (d=0.5km)

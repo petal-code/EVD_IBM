@@ -1,0 +1,27 @@
+report_date,period_start,period_end,date_midpoint,community_deaths_pct,numerator,denominator_n,denominator_type,source,source_url,notes
+8/4/18,,,8/3/18,70%,30,43,all cases,WHO AFRO report,https://www.who.int/emergencies/disease-outbreak-news/item/4-august-2018-ebola-drc-en,using probable cases/all cases for august as a rough proxy
+8/8/18,,,8/7/18,63%,27,43,all cases,WHO AFRO  report,https://www.afro.who.int/sites/default/files/2018-11/WCO%20EVD%20Update%20No5_0.pdf,"calculated using fraction of probable cases / deaths, given probable cases was defined early on as deaths in the community"
+8/17/18,8/1/18,8/15/18,8/15/18,61%,27,44,,WHO DON,https://www.who.int/emergencies/disease-outbreak-news/item/17-august-2018-ebola-drc-en,
+10/15/18,10/13/18,10/14/18,10/13/18,50%,3,6,,,https://www.cidrap.umn.edu/ebola/more-ebola-cases-who-weighs-emergency-declaration,
+10/19/18,10/19/18,10/19/18,10/19/18,67%,2,3,,,https://www.cidrap.umn.edu/ebola/news-scan-oct-19-2018,
+12/19/18,12/6/18,12/6/18,12/6/18,57%,4,7,cases,DRC MInistry of Health,http://translate.google.com/translate?hl=auto&langpair=auto%7Cen&u=https://us13.campaign-archive.com/%3Fu%3D89e5755d2cca4840b1af93176%26id%3Dc2608bba60,
+1/3/19,12/24/18,12/31/18,12/27/18,64%,7,11,confirmed cases,WHO SITREP 22,https://iris.who.int/bitstream/handle/10665/277472/SITREP-EVD-DRC-20190103-eng.pdf?isAllowed=y,
+11/6/18,10/26/18,11/4/18,10/30/18,50%,6,12,confirmed cases,WHO AFRO External Sitrep 14,,
+2/15/19,2/1/19,2/15/19,2/8/19,71%,,,cases per week,WHO DON May 16 2019,,Peak value reported in Feb 2019; exact week not specified
+2020-03-2019,3/18/19,3/31/19,3/24/19,55%,41,75,confirmed cases,UNICEF DRC Ebola sitrep,https://www.unicef.org/documents/drc-ebola-situation-reports-2019,
+5/16/19,4/1/19,5/16/19,4/23/19,40%,,,cases per week,WHO DON May 16 2019,,Range across all weeks from April to mid-May 2019; ~40% average 28-43% (avg ~40%)
+5/30/19,5/28/19,5/30/19,5/29/19,65%,,,,WHO DON,https://www.who.int/emergencies/disease-outbreak-news/item/30-may-2019-ebola-drc-en,
+6/6/19,5/15/19,6/4/19,5/25/19,34%,,,cases in 21-day period,WHO DON Jun 6 2019,,Approx 1/3 of cases dying outside ETCs per 21-day window
+6/23/19,6/10/19,6/16/19,6/13/19,26%,,,confirmed deaths,UNICEF DRC Ebola sitrep,,
+6/23/19,6/17/19,6/23/19,6/20/19,29%,,,confirmed cases,UNICEF DRC Ebola sitrep,,
+6/27/19,6/24/19,6/30/19,6/27/19,27%,,,confirmed deaths,UNICEF DRC Ebola sitrep,,
+7/4/19,7/1/19,7/7/19,7/4/19,24%,,,confirmed cases,UNICEF DRC Ebola sitrep,,
+7/11/19,7/8/19,7/14/19,7/11/19,28%,,,confirmed deaths,UNICEF DRC Ebola sitrep,,
+8/1/19,7/29/19,8/4/19,8/1/19,23%,,,confirmed cases,UNICEF DRC Ebola sitrep (week 32 report),,Week 31 value as cited in week 32 report for comparison
+8/8/19,8/5/19,8/11/19,8/8/19,26%,,,confirmed cases,UNICEF DRC Ebola sitrep (week 32 report),,Week 32 value; described as increased and 'worrying'
+8/15/19,8/12/19,8/18/19,8/15/19,32%,,,,,,
+12/11/19,11/25/19,12/1/19,11/28/19,9%,1,11,confirmed cases,WHO AFRO External Sitrep 71,,Prior-week value cited for comparison in Sitrep 71
+12/11/19,12/2/19,12/8/19,12/5/19,20%,2,10,confirmed cases,WHO AFRO External Sitrep 71,,Current-week value in Sitrep 71
+1/15/20,12/25/19,1/14/20,1/4/20,8%,3,36,confirmed deaths,WHO DON Jan 15 2020,,NOTE: denominator here is confirmed deaths not cases; 21-day window
+2/6/20,1/15/20,2/4/20,1/25/20,17%,3,18,confirmed cases,WHO DON Feb 6 2020,,3 community deaths among 18 confirmed cases in 21-day window
+11/18/20,6/1/20,11/18/20,8/25/20,29%,,,confirmed + probable cases,WHO DON Nov 18 2020,https://www.who.int/emergencies/disease-outbreak-news/item/ebola-virus-disease-democratic-republic-of-the-congo-draft,
