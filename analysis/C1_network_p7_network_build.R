@@ -49,12 +49,12 @@ output_dir    <- "output/network"
 shp_path      <- "data/shpmap/gadm41_COD_2.shp"
 
 hcw_rate     <- 13.78 / 10000  # HCWs per total population (DRC)
-comm_nb_size <- 0.1             # NB dispersion parameter
+comm_nb_size <- 0.2             # NB dispersion parameter
 network_seed <- 42L
 
 # Cases to run — set to NULL to run all three
 # Available: "case1_1M", "case2_Ituri", "case3_Kivu"
-run_cases <- c("case1_1M")
+run_cases <- c("case2_Ituri")
 
 # Bucket boundaries (km) — based on Meta Data for Good mobility bins
 # Bucket 0: same cell (d=0.5km)

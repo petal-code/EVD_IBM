@@ -21,7 +21,7 @@ library(dplyr)
 # ==============================================================================
 
 network_dir <- "output/network"
-case_tag    <- "case1_1M"   # "case1_1M", "case2_Ituri", "case3_Kivu"
+case_tag    <- "case2_Ituri"   # "case1_1M", "case2_Ituri", "case3_Kivu"
 
 # ==============================================================================
 # [Section 1] Load network outputs
