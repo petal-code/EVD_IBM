@@ -92,25 +92,25 @@ funeral_generation_time_fn <- local({
 # ==============================================================================
 
 p_inf_household_close            <- 0.00
-p_inf_household_physical         <- 0.15
+p_inf_household_physical         <- 0.1
 
 # Per single contact-event probability (3-week effective computed internally)
 p_inf_community_close_daily      <- 0.00
 p_inf_community_close_weekly     <- 0.00
 p_inf_community_close_monthly    <- 0.00
 
-p_inf_community_physical_daily   <- 0.055
-p_inf_community_physical_weekly  <- 0.02
-p_inf_community_physical_monthly <- 0.005
+p_inf_community_physical_daily   <- 0.0015*21
+p_inf_community_physical_weekly  <- 0.00152*3
+p_inf_community_physical_monthly <- 0.0015*3/4
 
 p_inf_hcw_to_hcw                 <- 0.02
 p_inf_patient_to_hcw             <- 0.02
 
 funeral_avg                      <- 15
-funeral_k                        <- 0.1   # fiber: overdisp_offspring_funeral=0.30
+funeral_k                        <- 0.3   # fiber: overdisp_offspring_funeral=0.30
 p_unsafe_funeral                 <- 0.50   # fallback scalar (overridden by TV comm/hosp fns)
-p_inf_funeral_household          <- 0.1
-p_inf_funeral_community          <- 0.1
+p_inf_funeral_household          <- 0.25
+p_inf_funeral_community          <- 0.25
 funeral_unsafe_multiplier        <- 1.0
 funeral_safe_multiplier          <- 0.20   # fiber: 1 - safe_funeral_efficacy = 1 - 0.80 = 0.20
 

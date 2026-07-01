@@ -106,6 +106,16 @@ ebola_network_sim <- function(
   pk_params                     = NULL,
   pd_params_trans               = NULL,
   pd_params_inf                 = NULL,
+  drug_eff_inf_data             = NULL,  # data.frame(t_since_treatment, eff):
+  # 투약 후 경과시간 기준 감염예방효과 곡선
+  # (상승→피크→하강). 공급 시 pk_params보다 우선.
+  dpc_efficacy_data             = NULL,  # DPC_fixed_efficacy_varied_d50.rds 형태:
+  # data.frame(dpc, efficacy, efficacy_lo, efficacy_hi, ...)
+  # dpc(onset→treatment 총 지연일수) 기준 효과곡선.
+  # 공급 시 drug_eff_inf_data/pk_params보다 우선.
+  dpc_efficacy_col              = "efficacy",  # 위 data.frame에서 사용할 컬럼명
+  # ("efficacy","efficacy_lo","efficacy_hi",
+  #  "eighty_efficacy_lo","eighty_efficacy_hi" 등)
 
   prob_treat_self               = 0,
   hcw_prep_start                = Inf,
@@ -126,7 +136,13 @@ ebola_network_sim <- function(
   prob_quarantine_given_trace_physical  = 0,
   prob_quarantine_given_trace_funeral   = 0,
   time_to_quarantine_fn         = function(n) rep(0, n),
+  notify_delay_fn               = NULL,  # 상수/function(n)/time_varying_fn:
+  # 발현 → 보고/인지(notify)까지 지연.
+  # NULL이면 임시로 입원지연과 동일하게 계산
+  # (onset_to_hospitalisation_fn(1) * hospitalisation_delay_factor(t))
   logistical_delay_fn           = function(n) rep(0, n),
+  # = distribute_delay: 보고 → 실제 투약/격리까지 지연
+  # (DPC 인풋 데이터는 여기로 들어감)
 
   # ── Ring tracing ──────────────────────────────────────────────────────────
   prob_trace_household          = 0,
@@ -191,13 +207,58 @@ ebola_network_sim <- function(
   p_eff_phys_weekly    <- p_inf_community_physical_weekly
   p_eff_phys_monthly   <- p_inf_community_physical_monthly
 
-  # PK/PD drug efficacy (one-compartment PK + Emax PD)
+  # PK/PD 드러그 효율 (1구획 PK + Emax PD)
   compute_drug_eff <- function(t_current, t_treated, pd_params, pk_params) {
     if (is.null(pk_params) || is.null(pd_params)) return(0)
     dt <- t_current - t_treated
     if (is.na(dt) || dt < 0) return(0)
     conc <- pk_params$dose * exp(-pk_params$ke * dt)
     pd_params$emax * conc / (pd_params$ec50 + conc)
+  }
+
+  # 데이터 기반 감염예방효과 곡선 (투약 후 경과시간 dt 기준, 상승→피크→하강 가능)
+  # dt < 0 (투약 전 노출)이면 효과 0. dt가 데이터 범위를 넘으면 마지막 값으로 고정.
+  drug_eff_inf_fn <- NULL
+  if (!is.null(drug_eff_inf_data)) {
+    drug_eff_inf_fn <- approxfun(
+      x    = drug_eff_inf_data$t_since_treatment,
+      y    = drug_eff_inf_data$eff,
+      rule = 2
+    )
+  }
+  compute_drug_eff_data <- function(eff_fn, t_current, t_treated) {
+    if (is.null(eff_fn) || is.na(t_treated)) return(0)
+    dt <- t_current - t_treated
+    if (is.na(dt) || dt < 0) return(0)
+    eff_fn(dt)
+  }
+
+  # DPC(onset → treatment 총 지연일수) 기준 효과 곡선
+  # 예: DPC_fixed_efficacy_varied_d50.rds — dpc_efficacy_col로 컬럼 선택
+  dpc_eff_fn <- NULL
+  dpc_at_peak <- 0  # PrEP(사전투약)에 쓸 "최댓값 효과" 지점 (기본값: dpc=0)
+  if (!is.null(dpc_efficacy_data)) {
+    if (!dpc_efficacy_col %in% names(dpc_efficacy_data))
+      stop(sprintf("dpc_efficacy_col '%s' not found in dpc_efficacy_data", dpc_efficacy_col))
+    dpc_eff_fn <- approxfun(
+      x    = dpc_efficacy_data$dpc,
+      y    = dpc_efficacy_data[[dpc_efficacy_col]],
+      rule = 2
+    )
+    # 곡선이 비단조(non-monotonic)일 수 있으므로, dpc=0이 아니라 실제 최댓값이 있는
+    # dpc 지점을 찾아서 PrEP에 사용 (항상 곡선의 진짜 최댓값을 보장)
+    dpc_at_peak <- dpc_efficacy_data$dpc[which.max(dpc_efficacy_data[[dpc_efficacy_col]])]
+  }
+
+  # logistical_delay_fn이 make_time_varying()으로 만든 시간가변 함수(class "time_varying_fn")면
+  # 캘린더 시간 t에서 결정론적 지연값을 반환, 아니면 기존처럼 확률적 draw(n=1)
+  # fn: time_varying_fn(클래스 태그) -> 캘린더시간 t에서 결정론적 값
+  #     일반 function(n)         -> 기존처럼 확률적 draw(n=1)
+  #     순수 숫자(상수)           -> 그대로 상수 반환 (DPC를 상수로 고정하고 싶을 때)
+  resolve_delay <- function(fn, t) {
+    if (inherits(fn, "time_varying_fn")) fn(t)
+    else if (is.function(fn)) fn(1)
+    else fn
   }
 
   # ── Load sim_prep (O(1) neighbor lookup) ──────────────────────────────────
@@ -249,6 +310,36 @@ ebola_network_sim <- function(
   treated              <- rep(0L,           N)
   time_treated         <- rep(NA_real_,     N)
   quarantined          <- rep(0L,           N)
+  dpc_value            <- rep(NA_real_,     N)  # 각 개인이 실제로 받은 onset→treatment 지연(dpc)
+
+  # ── 약물로 막힌(prevented) 노출 이벤트 로그 (queue와 동일한 grow-on-demand 버퍼) ──
+  prevented_cap        <- max(1000L, N %/% 100L)
+  prevented_n           <- 0L
+  prevented_target_id   <- integer(prevented_cap)   # 노출당했지만 감염 안 된 사람
+  prevented_source_id   <- integer(prevented_cap)   # 감염원
+  prevented_t_exposure  <- numeric(prevented_cap)
+  prevented_dpc         <- numeric(prevented_cap)
+  prevented_eff         <- numeric(prevented_cap)
+  prevented_ctype       <- integer(prevented_cap)
+
+  log_prevented <- function(target_id, source_id, t_exposure, dpc, eff, ctype) {
+    prevented_n <<- prevented_n + 1L
+    if (prevented_n > prevented_cap) {
+      prevented_cap         <<- prevented_cap * 2L
+      prevented_target_id   <<- c(prevented_target_id,  integer(prevented_cap %/% 2L))
+      prevented_source_id   <<- c(prevented_source_id,  integer(prevented_cap %/% 2L))
+      prevented_t_exposure  <<- c(prevented_t_exposure, numeric(prevented_cap %/% 2L))
+      prevented_dpc         <<- c(prevented_dpc,        numeric(prevented_cap %/% 2L))
+      prevented_eff         <<- c(prevented_eff,        numeric(prevented_cap %/% 2L))
+      prevented_ctype       <<- c(prevented_ctype,      integer(prevented_cap %/% 2L))
+    }
+    prevented_target_id[prevented_n]  <<- target_id
+    prevented_source_id[prevented_n]  <<- source_id
+    prevented_t_exposure[prevented_n] <<- t_exposure
+    prevented_dpc[prevented_n]        <<- dpc
+    prevented_eff[prevented_n]        <<- eff
+    prevented_ctype[prevented_n]      <<- ctype
+  }
   time_quarantined     <- rep(NA_real_,     N)
   traced_via           <- rep(NA_character_,N)
 
@@ -367,6 +458,7 @@ ebola_network_sim <- function(
     prep_idx <- hcw_idx[rbinom(length(hcw_idx), 1L, prob_treat_hcw_prep) == 1L]
     treated[prep_idx]      <- 1L
     time_treated[prep_idx] <- hcw_prep_start
+    dpc_value[prep_idx]    <- dpc_at_peak  # 사전(prophylactic) 투약: 항상 최댓값 효과 사용
     hcw_prep_deployed      <- TRUE
     message(sprintf("  HCW PrEP at t0: %d HCWs treated", length(prep_idx)))
   }
@@ -388,33 +480,43 @@ ebola_network_sim <- function(
   # Resolve funeral generation time function (fallback to community Tg if not supplied)
   funeral_Tg_fn <- if (!is.null(funeral_generation_time_fn))
     funeral_generation_time_fn else generation_time_fn
-  passes_gates <- function(idx, nbr_id, t_inf_nbr, p_inf, eff_trans_src) {
+  passes_gates <- function(idx, nbr_id, t_inf_nbr, p_inf, eff_trans_src, ctype = NA_integer_) {
     if (rbinom(1, 1, p_inf) == 0L) return(FALSE)
     if (eff_trans_src > 0 && rbinom(1, 1, eff_trans_src) == 1L) return(FALSE)
     if (quarantined[idx] == 1L && !is.na(time_quarantined[idx]) &&
         t_inf_nbr > time_quarantined[idx] &&
         rbinom(1, 1, quarantine_efficacy) == 1L) return(FALSE)
     eff_inf_tgt <- if (treated[nbr_id] == 1L) {
-      if (!is.null(pk_params))
+      if (!is.null(dpc_eff_fn) && !is.na(dpc_value[nbr_id]))
+        dpc_eff_fn(dpc_value[nbr_id])
+      else if (!is.null(drug_eff_inf_fn))
+        compute_drug_eff_data(drug_eff_inf_fn, t_inf_nbr, time_treated[nbr_id])
+      else if (!is.null(pk_params))
         compute_drug_eff(t_inf_nbr, time_treated[nbr_id], pd_params_inf, pk_params)
       else drug_eff_inf
     } else 0
-    if (eff_inf_tgt > 0 && rbinom(1, 1, eff_inf_tgt) == 1L) return(FALSE)
+    if (eff_inf_tgt > 0 && rbinom(1, 1, eff_inf_tgt) == 1L) {
+      log_prevented(nbr_id, idx, t_inf_nbr, dpc_value[nbr_id], eff_inf_tgt, ctype)
+      return(FALSE)
+    }
     TRUE
   }
 
   # ── Ring intervention helper ──────────────────────────────────────────────
   apply_ring <- function(nbr_ids, trace_prob, treat_prob, quar_prob,
                          trace_label, t_ring, delay) {
+    # treat_prob: 상수 또는 function(t) (antiviral coverage가 시간에 따라 변하는 경우)
+    treat_prob_t <- resolve_prob(treat_prob, t_ring)
     for (nbr_id in nbr_ids) {
       if (!is.na(traced_via[nbr_id])) next
       if (rbinom(1, 1, trace_prob) == 0L) next
       traced_via[nbr_id] <<- trace_label
-      if (treat_prob > 0 && treated[nbr_id] == 0L &&
+      if (treat_prob_t > 0 && treated[nbr_id] == 0L &&
           is.finite(t_ring) && t_ring >= antiviral_start &&
-          rbinom(1, 1, treat_prob) == 1L) {
+          rbinom(1, 1, treat_prob_t) == 1L) {
         treated[nbr_id]      <<- 1L
         time_treated[nbr_id] <<- t_ring + delay
+        dpc_value[nbr_id]    <<- delay  # 보고→투약(distribute_delay) 그 자체가 DPC
       }
       if (quar_prob > 0 && quarantined[nbr_id] == 0L &&
           is.finite(t_ring) && t_ring >= quarantine_start &&
@@ -448,6 +550,7 @@ ebola_network_sim <- function(
       prep_idx <- hcw_idx[rbinom(length(hcw_idx), 1L, prob_treat_hcw_prep) == 1L]
       treated[prep_idx]      <- 1L
       time_treated[prep_idx] <- hcw_prep_start
+      dpc_value[prep_idx]    <- dpc_at_peak  # 사전(prophylactic) 투약: 항상 최댓값 효과 사용
       hcw_prep_deployed      <- TRUE
       message(sprintf("  HCW PrEP deployed at t=%.1f: %d HCWs",
                       hcw_prep_start, length(prep_idx)))
@@ -468,13 +571,21 @@ ebola_network_sim <- function(
       else drug_eff_trans
     } else 0
 
-    logistical_delay <- logistical_delay_fn(1)
+    # notify_delay: 발현 → 보고/인지. notify_delay_fn 없으면 임시로 입원지연과 동일하게.
+    notify_delay <- if (!is.null(notify_delay_fn)) {
+      resolve_delay(notify_delay_fn, t_onset_idx)
+    } else {
+      onset_to_hospitalisation_fn(1) * resolve_tv(hospitalisation_delay_factor, t_onset_idx)
+    }
+    # distribute_delay: 보고 → 실제 투약/격리. DPC 인풋 데이터가 여기로 들어옴.
+    distribute_delay <- resolve_delay(logistical_delay_fn, t_onset_idx)
 
-    # Self-treatment
+    # Self-treatment (본인이 이미 인지한 상태이므로 notify 단계 없이 distribute_delay만 적용)
+    prob_treat_self_t <- resolve_prob(prob_treat_self, t_onset_idx)
     if (!is.na(t_onset_idx) && t_onset_idx >= antiviral_start &&
-        treated[idx] == 0L && rbinom(1, 1, prob_treat_self) == 1L) {
+        treated[idx] == 0L && rbinom(1, 1, prob_treat_self_t) == 1L) {
       treated[idx]      <- 1L
-      time_treated[idx] <- t_onset_idx + logistical_delay
+      time_treated[idx] <- t_onset_idx + distribute_delay
     }
 
     # Self-quarantine
@@ -487,7 +598,7 @@ ebola_network_sim <- function(
     t_ring <- if (!is.na(t_onset_idx) &&
                   (t_onset_idx >= antiviral_start ||
                    t_onset_idx >= quarantine_start))
-      t_onset_idx + logistical_delay else Inf
+      t_onset_idx + notify_delay else Inf
 
     # Ring interventions (O(1) lookup from sim_prep)
     if (is.finite(t_ring)) {
@@ -495,7 +606,7 @@ ebola_network_sim <- function(
                  prob_trace_household,
                  prob_treat_given_trace_household,
                  prob_quarantine_given_trace_household,
-                 "household", t_ring, logistical_delay)
+                 "household", t_ring, distribute_delay)
 
       apply_ring(unique(c(comm_close_daily_nbrs[[idx]],
                           comm_close_weekly_nbrs[[idx]],
@@ -503,7 +614,7 @@ ebola_network_sim <- function(
                  prob_trace_close,
                  prob_treat_given_trace_close,
                  prob_quarantine_given_trace_close,
-                 "close", t_ring, logistical_delay)
+                 "close", t_ring, distribute_delay)
 
       apply_ring(unique(c(comm_phys_daily_nbrs[[idx]],
                           comm_phys_weekly_nbrs[[idx]],
@@ -511,7 +622,7 @@ ebola_network_sim <- function(
                  prob_trace_physical,
                  prob_treat_given_trace_physical,
                  prob_quarantine_given_trace_physical,
-                 "physical", t_ring, logistical_delay)
+                 "physical", t_ring, distribute_delay)
     }
 
     # =========================================================================
@@ -532,7 +643,7 @@ ebola_network_sim <- function(
       if (p_eff_hh <= 0) next
       t_inf_nbr <- t_inf_idx + generation_time_fn(1)
       if (t_inf_nbr > t_phase1_end) next
-      if (!passes_gates(idx, nbr_id, t_inf_nbr, p_eff_hh, eff_trans_src)) next
+      if (!passes_gates(idx, nbr_id, t_inf_nbr, p_eff_hh, eff_trans_src, ctype = 1L)) next
       infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, 1L)
       enqueue(nbr_id, t_inf_nbr)
       n_cumul_infected <- n_cumul_infected + 1L
@@ -570,7 +681,7 @@ ebola_network_sim <- function(
         if (status[nbr_id] != 1L) next
         t_inf_nbr <- t_inf_idx + generation_time_fn(1)
         if (t_inf_nbr > t_phase1_end) next
-        if (!passes_gates(idx, nbr_id, t_inf_nbr, grp$p_inf, eff_trans_src)) next
+        if (!passes_gates(idx, nbr_id, t_inf_nbr, grp$p_inf, eff_trans_src, ctype = grp$ctype)) next
         infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, grp$ctype)
         enqueue(nbr_id, t_inf_nbr)
         n_cumul_infected <- n_cumul_infected + 1L
@@ -599,14 +710,15 @@ ebola_network_sim <- function(
         # ETU isolation + IPC maturity reduce post-admission transmission
         hosp_quar_eff_t <- compute_hospital_quarantine_eff(t_inf_nbr)
         if (hosp_quar_eff_t > 0 && rbinom(1, 1, hosp_quar_eff_t) == 1L) next
-        if (!passes_gates(idx, nbr_id, t_inf_nbr, p_inf_p2, eff_trans_src)) next
+        if (!passes_gates(idx, nbr_id, t_inf_nbr, p_inf_p2, eff_trans_src, ctype = 4L)) next
 
         # HCW PEP on exposure
         if (isTRUE(v_is_hcw[nbr_id]) && prob_treat_hcw_pep > 0 &&
             treated[nbr_id] == 0L &&
             rbinom(1, 1, prob_treat_hcw_pep) == 1L) {
           treated[nbr_id]      <- 1L
-          time_treated[nbr_id] <- t_inf_nbr + logistical_delay
+          time_treated[nbr_id] <- t_inf_nbr + distribute_delay
+          dpc_value[nbr_id]    <- distribute_delay  # 노출→PEP 투약까지 지연
         }
 
         infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, 4L)
@@ -673,7 +785,7 @@ ebola_network_sim <- function(
                    prob_trace_funeral,
                    prob_treat_given_trace_funeral,
                    prob_quarantine_given_trace_funeral,
-                   "funeral", t_ring, logistical_delay)
+                   "funeral", t_ring, distribute_delay)
       }
 
       # Transmission
@@ -683,7 +795,7 @@ ebola_network_sim <- function(
       for (nbr_id in hh_att) {
         if (status[nbr_id] != 1L) next
         t_inf_nbr <- t_out_idx + funeral_Tg_fn(1)
-        if (!passes_gates(idx, nbr_id, t_out_idx, p_inf_f_hh, eff_trans_src)) next
+        if (!passes_gates(idx, nbr_id, t_out_idx, p_inf_f_hh, eff_trans_src, ctype = 5L)) next
         infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, 5L)
         enqueue(nbr_id, t_inf_nbr)
         n_cumul_infected <- n_cumul_infected + 1L
@@ -692,7 +804,7 @@ ebola_network_sim <- function(
       for (nbr_id in all_comm_att) {
         if (status[nbr_id] != 1L) next
         t_inf_nbr <- t_out_idx + funeral_Tg_fn(1)
-        if (!passes_gates(idx, nbr_id, t_out_idx, p_inf_f_comm, eff_trans_src)) next
+        if (!passes_gates(idx, nbr_id, t_out_idx, p_inf_f_comm, eff_trans_src, ctype = 6L)) next
         infect_individual(nbr_id, idx, t_inf_nbr, gen_idx + 1L, 6L)
         enqueue(nbr_id, t_inf_nbr)
         n_cumul_infected <- n_cumul_infected + 1L
@@ -728,6 +840,7 @@ ebola_network_sim <- function(
     contact_type         = contact_type_vec[infected_mask],
     treated              = treated[infected_mask],
     time_treated         = time_treated[infected_mask],
+    dpc_value            = dpc_value[infected_mask],
     quarantined          = quarantined[infected_mask],
     time_quarantined     = time_quarantined[infected_mask],
     traced_via           = traced_via[infected_mask],
@@ -736,8 +849,25 @@ ebola_network_sim <- function(
   infected_df <- infected_df[order(infected_df$time_infection,
                                    infected_df$person_id), ]
 
+  # ── prevented_df: 약물로 막힌 노출 이벤트 (1건당 1행, 같은 사람이 여러 번 나올 수 있음) ──
+  prevented_idx <- seq_len(prevented_n)
+  prevented_df <- data.frame(
+    target_person_id   = v_person_id[prevented_target_id[prevented_idx]],
+    source_person_id   = v_person_id[prevented_source_id[prevented_idx]],
+    target_is_hcw       = v_is_hcw[prevented_target_id[prevented_idx]],
+    contact_type        = prevented_ctype[prevented_idx],
+    time_exposure       = prevented_t_exposure[prevented_idx],
+    dpc_value            = prevented_dpc[prevented_idx],
+    eff_inf_used         = prevented_eff[prevented_idx],
+    time_treated         = time_treated[prevented_target_id[prevented_idx]],
+    stringsAsFactors     = FALSE
+  )
+  prevented_df <- prevented_df[order(prevented_df$time_exposure,
+                                     prevented_df$target_person_id), ]
+
   list(
     infected         = infected_df,
+    prevented        = prevented_df,
     stop_reason      = stop_reason,
     n_cumul_infected = n_cumul_infected,
     n_active_at_stop = queue_size()
