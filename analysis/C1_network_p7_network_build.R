@@ -1,15 +1,24 @@
 # ==============================================================================
-# C1_network_p7_network_build.R
+# C1_network_p7_network_build.R  (v2)
 # Purpose:
 #   For each simulation case (case1_1M, case2_Ituri, case3_Kivu):
 #     1. Load synthetic population (from p4)
 #     2. Build full cell-cell distance bucket matrix
 #     3. Build cell-age member index
 #     4. Build Layer 1: household edges (full clique)
-#     5. Build Layer 2: community edges — single C++ pass using prem_unique
-#        (daily+weekly+monthly combined matrix from p6).
-#        Each edge allocated to one stratum via Multinomial(stratum_prob_mat),
-#        and assigned is_physical flag via Bernoulli(blended_ratio_comm).
+#     5. Build Layer 2: community edges — single C++ pass.
+#        v2 CHANGE: physical and non-physical contacts are now drawn as two
+#        INDEPENDENT processes (not close-then-Bernoulli-thin):
+#          - non-physical degree ~ Poisson(mu_nonphys_i)
+#          - physical     degree ~ NegBin(mu_phys_i, size = phys_nb_size)
+#        Each process also uses its OWN row-normalized age-partner
+#        distribution (physical and non-physical contacts can have
+#        different age patterns). Stratum (daily/weekly/monthly) is still
+#        allocated via Multinomial(stratum_prob_mat) per participant age,
+#        independent of physical status.
+#        Collision handling: for a given participant, physical partners are
+#        drawn first; if the non-physical pass later picks the same
+#        partner, that pick is dropped ("physical wins" on collision).
 #        Output: three separate edge files (daily/weekly/monthly),
 #        each with columns: from, to, is_physical
 #     6. Build Layer 3: healthcare edges
@@ -18,9 +27,12 @@
 #     7. Save all network layers
 #
 # Input matrices from p6 (build_DRC_network_matrices.R):
-#   prem_unique_community : 16x16 unique contact matrix (sum of three strata)
-#   stratum_prob_mat      : 16x3 stratum allocation probs [p_daily, p_weekly, p_monthly]
-#   blended_ratio_comm    : 16x16 community physical contact ratio
+#   prem_unique_community  : 16x16 unique contact matrix (sum of three strata)
+#   stratum_prob_mat       : 16x3 stratum allocation probs [p_daily, p_weekly, p_monthly]
+#   physical_unique_3wk    : list(daily/weekly/monthly)$community — used to
+#                             build physical_unique_community
+#   (nonphysical_unique_community is derived here as
+#    prem_unique_community - physical_unique_community)
 #
 # Output per case (output/network/):
 #   {tag}_nodes.rds
@@ -48,9 +60,9 @@ kernel_path   <- "output/kernel/community_distance_kernel.rds"
 output_dir    <- "output/network"
 shp_path      <- "data/shpmap/gadm41_COD_2.shp"
 
-hcw_rate     <- 13.78 / 10000  # HCWs per total population (DRC)
-comm_nb_size <- 0.2             # NB dispersion parameter
-network_seed <- 42L
+hcw_rate      <- 13.78 / 10000  # HCWs per total population (DRC)
+phys_nb_size  <- 0.25           # NB dispersion parameter for PHYSICAL contact draws
+network_seed  <- 42L
 
 # Cases to run — set to NULL to run all three
 # Available: "case1_1M", "case2_Ituri", "case3_Kivu"
@@ -75,21 +87,34 @@ message("=== Section 1: Loading shared data ===")
 # Load p6 output
 mats <- readRDS(matrices_path)
 
-# Unified unique contact matrix (daily+weekly+monthly combined)
-# Sampled once in C++; each edge allocated to a stratum via Multinomial
+# Total unique community contact matrix (daily+weekly+monthly combined)
 prem_unique      <- mats$prem_unique_community   # 16x16
 stratum_prob_mat <- mats$stratum_prob_mat        # 16x3 [p_daily, p_weekly, p_monthly]
-blended_ratio_comm <- mats$blended_ratio_comm    # 16x16 community physical ratio
+
+# v2: physical / non-physical are split into two independent matrices,
+# each row-normalized separately inside the C++ builder.
+physical_unique_community <- mats$physical_unique_3wk$daily$community +
+  mats$physical_unique_3wk$weekly$community +
+  mats$physical_unique_3wk$monthly$community
+
+nonphysical_unique_community <- prem_unique - physical_unique_community
+# guard against tiny negative floating-point residue
+nonphysical_unique_community[nonphysical_unique_community < 0] <- 0
 
 # Also load household blended_ratio for Layer 1 (not used in C++ but kept for reference)
 blended_ratio_home <- mats$blended_ratio$home
 
 message(sprintf("  prem_unique rowSum range: %.2f - %.2f",
                 min(rowSums(prem_unique)), max(rowSums(prem_unique))))
+message(sprintf("  physical_unique_community rowSum range: %.2f - %.2f",
+                min(rowSums(physical_unique_community)), max(rowSums(physical_unique_community))))
+message(sprintf("  nonphysical_unique_community rowSum range: %.2f - %.2f",
+                min(rowSums(nonphysical_unique_community)), max(rowSums(nonphysical_unique_community))))
+message(sprintf("  recovery check (physical+nonphysical should equal prem_unique): max abs diff = %.2e",
+                max(abs((physical_unique_community + nonphysical_unique_community) - prem_unique))))
 message(sprintf("  stratum_prob_mat check (should sum to ~1): [%.4f, %.4f]",
                 min(rowSums(stratum_prob_mat)), max(rowSums(stratum_prob_mat))))
-message(sprintf("  blended_ratio_comm mean (nonzero): %.4f",
-                mean(blended_ratio_comm[blended_ratio_comm > 0])))
+message(sprintf("  phys_nb_size (physical draw dispersion): %.3f", phys_nb_size))
 
 # Distance kernel parameters
 kernel <- readRDS(kernel_path)
@@ -209,8 +234,10 @@ build_cell_age_members <- function(pop_nodes, n_cells) {
 
 # ==============================================================================
 # [Helper] Build all community layers in one C++ pass
-# Samples from prem_unique; allocates each edge to daily/weekly/monthly
-# via Multinomial; assigns is_physical via Bernoulli(blended_ratio_comm).
+# v2: physical and non-physical are drawn as independent processes
+# (Poisson vs NegBin, each with its own age-partner distribution); on
+# collision within a participant's own draws, physical wins. Each edge is
+# also allocated to daily/weekly/monthly via Multinomial(stratum_prob_mat).
 # Returns list of three data.frames: daily, weekly, monthly
 # each with columns: from, to, is_physical
 # ==============================================================================
@@ -226,11 +253,11 @@ build_community_layers <- function(pop_nodes, cdist, seed) {
   init_edge_builder(
     bucket_mat_r      = cdist$bucket_mat,
     cell_age_members  = cell_age_members,
-    prem_unique       = prem_unique,
+    nonphys_unique    = nonphysical_unique_community,
+    phys_unique       = physical_unique_community,
     stratum_prob_mat  = stratum_prob_mat,
-    phys_ratio_matrix = blended_ratio_comm,
     bucket_weights    = bucket_weights,
-    nb_size           = comm_nb_size
+    phys_nb_size      = phys_nb_size
   )
   rm(cell_age_members); gc()
 
@@ -245,12 +272,21 @@ build_community_layers <- function(pop_nodes, cdist, seed) {
     seed       = seed
   ))
   # stratum: 0=daily, 1=weekly, 2=monthly
+  # is_physical is now determined by which pass (physical/non-physical)
+  # generated the edge, with physical-wins collision handling already
+  # applied per participant inside the C++ builder.
 
   message(sprintf("    C++ edges built: %d total (%.1f sec)",
                   nrow(edges), proc.time()[["elapsed"]] - t1))
+  message(sprintf("    physical=%d | non-physical=%d",
+                  sum(edges$is_physical == 1L), sum(edges$is_physical == 0L)))
 
-  # Split by stratum and deduplicate within each
-  # (within-stratum duplicates kept with is_physical=max)
+  # Split by stratum and deduplicate within each.
+  # NOTE: physical/non-physical collisions are already resolved inside the
+  # C++ builder (physical wins) for a given participant's own draws. This
+  # dedup step still guards against the pre-existing residual case where
+  # two DIFFERENT participants independently sample each other within the
+  # same stratum (kept with is_physical=max, i.e. physical wins there too).
   split_and_dedup <- function(s) {
     edges[edges$stratum == s, c("from","to","is_physical")] %>%
       group_by(from, to) %>%
@@ -391,8 +427,8 @@ for (fi in seq_along(pop_files)) {
   rm(hh_edges); gc()
 
   # ── Layer 2: Community edges — single C++ pass, split into daily/weekly/monthly
-  # All three strata built at once; edges allocated via Multinomial on stratum probs
-  # is_physical flag assigned via Bernoulli(blended_ratio_comm[age_i, age_j])
+  # v2: physical (NegBin, k=0.25) and non-physical (Poisson) sampled
+  # independently per participant; physical wins on within-person collision.
 
   if (all(file.exists(c(out_layer2d, out_layer2w, out_layer2m)))) {
     message("    Layer 2: all strata exist, skip")

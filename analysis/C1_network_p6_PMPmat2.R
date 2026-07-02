@@ -1,45 +1,42 @@
 # ============================================================
-# Build frequency-stratified 3-week contact matrices for DRC (Congo)
-# and produce visualization figures.
+# Build frequency-stratified 3-week contact matrices for DRC (Congo),
+# now generalized to THREE unique-partner models (linear / Bernoulli s=1 /
+# Bernoulli s=0.5), and produce visualization figures for each.
 #
-# v2 changes (agreed in discussion):
-#   1. Population (WorldPop) weighting REMOVED from this script entirely.
-#      Everything here is a per-capita (1-person-average) rate matrix.
-#      Population belongs to a downstream "network/node generation" script.
-#   2. Home is NOT frequency-stratified (data limitation: only close/physical
-#      split for home; daily/weekly/monthly split is reserved for work/
-#      school/other only).
-#   3. Two-stage close-contact quantity per stratum, both kept:
-#        - "events"  = total 3-week CONTACT EVENTS (raw count, repeats
-#                       included) = prem_mats * 21, split by stratum
-#                       proportion (row/col symmetrized).
-#        - "unique"  = estimated UNIQUE PARTNERS ACTUALLY CONTACTED at least
-#                       once within the 3-week (21-day) window = events *
-#                       appear_factor[stratum]. This is a WINDOW-SPECIFIC
-#                       unique count (edges that really occurred in these 21
-#                       days), NOT a roster/relationship-count estimate.
-#      Derivation: assume each of N partners in a stratum has an independent
-#      daily Bernoulli(p) chance of contact, p = 1/T_avg (T_avg = average
-#      revisit interval). Over L=21 days:
-#        events (E)      = N * p * L                    (expected event count)
-#        unique_A        = N * [1 - (1-p)^L]             (expected # partners
-#                                                          contacted >=1 time)
-#      Eliminating the unobserved roster size N = E / (p*L):
-#        appear_factor(stratum) = unique_A / E = [1 - (1-p)^L] / (p*L)
-#      With T_avg = {1, 7, 28} days for {daily, weekly, monthly}:
-#        daily   : p=1     -> factor = 1/21           ≈ 0.0476
-#        weekly  : p=1/7   -> factor = [1-(6/7)^21]/3  ≈ 0.3202
-#        monthly : p=1/28  -> factor = [1-(27/28)^21]/(21/28) ≈ 0.7121
-#      By construction factor <= 1 for every stratum (a sum of L Bernoulli
-#      trials can have at most L successes, and P(>=1 success) <= E[count]),
-#      so unique is guaranteed <= events for daily/weekly/monthly alike —
-#      unlike the earlier roster-based factor (4/3 for monthly), which
-#      estimated relationship-network size rather than window-specific
-#      contact edges.
-#   4. Physical-contact versions of both "events" and "unique" are also kept,
-#      using the LIC-blended physical/close ratio (Step 4-6, unchanged).
-#   5. Community (work+school+other) assumed additive/independent (known
-#      limitation, accepted).
+# v3 changes (this merge):
+#   - Merges the matrix-construction script (p6) with the rarefaction /
+#     scale-comparison diagnostic code into a single script.
+#   - appear_factor is now computed for THREE models instead of one:
+#       "linear" : unique = events (appear_factor = 1 for every stratum;
+#                  this is what the "fully independent, brand-new partner
+#                  every event" assumption reduces to at t = L = 21)
+#       "s1"     : Bernoulli, T_eff = T_avg (this is the ORIGINAL v2 model —
+#                  kept as the default/backward-compatible close_unique_3wk /
+#                  physical_unique_3wk used by p7)
+#       "s05"    : Bernoulli, T_eff = max(T_avg * 0.5, 1) — assumes true
+#                  revisit interval is half the nominal label (people meet
+#                  ~2x more often than "weekly"/"monthly" suggests). Daily
+#                  is clamped at T_eff=1 since it's already the fastest
+#                  representable rate in this discrete daily model.
+#   - close_unique_3wk / physical_unique_3wk (top-level, used by p7) remain
+#     the "s1" (current) model, unchanged in name/shape for compatibility.
+#   - All three models' full unique matrices are ALSO saved under
+#     close_unique_3wk_by_model / physical_unique_3wk_by_model.
+#   - Visualization: age-stratified cumulative bar charts (both the
+#     close-only 3-segment stack, and the close/physical 6-segment stack)
+#     are now produced once PER MODEL (3 models x 2 chart types = 6 figures),
+#     all on a SHARED y-axis scale so the three models are visually
+#     comparable. The events row (model-independent) is a separate figure.
+#
+# Earlier v2 design choices (still in effect):
+#   1. Population (WorldPop) weighting is NOT used in matrix construction —
+#      everything is a per-capita rate matrix. Population belongs to a
+#      downstream network/node generation script.
+#   2. Home is NOT frequency-stratified (close/physical split only).
+#   3. events = raw 3-week contact counts (repeats included); unique =
+#      events * appear_factor[stratum], now parametrized by model.
+#   4. Physical-contact versions use the LIC-blended physical/close ratio.
+#   5. Community (work+school+other) assumed additive/independent.
 # ============================================================
 
 library(socialmixr)
@@ -79,28 +76,44 @@ freq_category_labels <- c(
   `4` = "less_often", `5` = "first_time"
 )
 
-# Window-specific unique-partner factor over a 21-day (3-week) window.
-# Assumes each partner in a stratum has an independent daily Bernoulli(p)
-# contact chance, p = 1/T_avg, with T_avg fixed at 1/7/28 days for
-# daily/weekly/monthly (data limitation: POLYMOD only gives ordinal
-# frequency categories, not exact intervals).
-#   appear_factor(stratum) = [1 - (1-p)^L] / (p*L),  L = 21
-# This equals unique_partners_actually_contacted / events, i.e. it answers
-# "of the contact events in this stratum, how many distinct people do they
-# collapse down to, given some partners are hit more than once in 21 days
-# and others (esp. monthly) may be hit zero times." Guaranteed <= 1 for
-# every stratum, so unique <= events always (unlike a roster-size estimate).
 avg_revisit_days <- c(daily = 1, weekly = 7, monthly = 28)
 window_L <- 21
 
-appear_factor <- sapply(avg_revisit_days, function(T_avg) {
-  p <- 1 / T_avg
-  (1 - (1 - p)^window_L) / (p * window_L)
-})
+# ------------------------------------------------------------
+# Step 0b: three unique-partner models
+#   linear : appear_factor = 1 for every stratum (unique == events)
+#   s1     : Bernoulli, T_eff = T_avg (current/default — used by p7)
+#   s05    : Bernoulli, T_eff = max(T_avg * 0.5, 1)
+# ------------------------------------------------------------
+model_defs <- list(
+  linear = list(type = "linear"),
+  s1     = list(type = "bernoulli", s = 1.0),
+  s05    = list(type = "bernoulli", s = 0.5)
+)
+model_labels <- c(
+  linear = "Linear (unique = events)",
+  s1     = "Bernoulli, s = 1 (current)",
+  s05    = "Bernoulli, s = 0.5"
+)
 
-message("== appear_factor (unique partners actually contacted / events) ==")
-for (st in names(appear_factor)) {
-  message(sprintf("  %-8s: %.4f", st, appear_factor[st]))
+compute_appear_factor <- function(model) {
+  if (model$type == "linear") {
+    return(c(daily = 1, weekly = 1, monthly = 1))
+  }
+  sapply(avg_revisit_days, function(T_avg) {
+    T_eff <- max(T_avg * model$s, 1)
+    p     <- 1 / T_eff
+    (1 - (1 - p)^window_L) / (p * window_L)
+  })
+}
+
+appear_factor_by_model <- lapply(model_defs, compute_appear_factor)
+
+message("== appear_factor by model ==")
+for (mn in names(appear_factor_by_model)) {
+  af <- appear_factor_by_model[[mn]]
+  message(sprintf("  [%s] daily=%.4f weekly=%.4f monthly=%.4f",
+                  mn, af["daily"], af["weekly"], af["monthly"]))
 }
 
 mousa_lic_physical <- c(
@@ -177,8 +190,6 @@ compute_frequency_proportions_by_age <- function(loc_cols, loc_name) {
   prop_df[, c("age_group", "location", freq_category_labels[as.character(1:5)])]
 }
 
-# Diagnostic table kept for ALL locations (used by Plot F / diagnostics),
-# but only work/school/other are actually used to stratify the 3-week matrices.
 frequency_proportion_diagnostic <- do.call(
   rbind,
   lapply(names(prem_to_polymod_loc), function(loc) {
@@ -186,7 +197,7 @@ frequency_proportion_diagnostic <- do.call(
   })
 )
 
-message("== Frequency category proportions by age group and location ==")
+message("\n== Frequency category proportions by age group and location ==")
 for (loc in locations) {
   message(sprintf("\n-- %s --", loc))
   sub_diag <- frequency_proportion_diagnostic[
@@ -210,7 +221,6 @@ compute_stratum_proportions_by_age <- function(loc_cols) {
   })
 }
 
-# Only computed (and NA-imputed) for the locations we actually stratify.
 stratum_props <- lapply(prem_to_polymod_loc[split_locations], compute_stratum_proportions_by_age)
 
 for (loc in names(stratum_props)) {
@@ -223,10 +233,8 @@ for (loc in names(stratum_props)) {
 
 # ------------------------------------------------------------
 # Step 3: Build 3-week CONTACT EVENT matrices (raw, repeats included),
-#         then split by frequency stratum. Population-free throughout.
+#         then split by frequency stratum. Population-free; model-independent.
 # ------------------------------------------------------------
-
-# Stage 1: total 3-week contact events (no stratification yet)
 total_events_3wk <- setNames(
   lapply(split_locations, function(loc) prem_mats[[loc]] * 21),
   split_locations
@@ -239,8 +247,6 @@ for (loc in split_locations) {
                   max(rowSums(total_events_3wk[[loc]]))))
 }
 
-# Stage 2: stratum split (row/col symmetrized, since stratum_props is
-# indexed by participant age and the matrix must stay symmetric)
 apply_stratum_split <- function(total_events_mat, prop_vec) {
   M_row <- total_events_mat * matrix(prop_vec, nrow = 16, ncol = 16, byrow = FALSE)
   M_col <- total_events_mat * matrix(prop_vec, nrow = 16, ncol = 16, byrow = TRUE)
@@ -257,7 +263,6 @@ for (st in names(freq_strata)) {
   close_events_3wk[[st]]$community <- Reduce(`+`, close_events_3wk[[st]][split_locations])
 }
 
-# Sanity check: daily+weekly+monthly events should recover total_events_3wk
 message("\n== Stratum-split event recovery check (should equal total_events_3wk) ==")
 for (loc in split_locations) {
   recovered <- close_events_3wk$daily[[loc]] + close_events_3wk$weekly[[loc]] + close_events_3wk$monthly[[loc]]
@@ -364,6 +369,7 @@ blended_ratio_comm <- (blended_ratio$work + blended_ratio$school + blended_ratio
 
 # ------------------------------------------------------------
 # Step 6: Apply blended ratio -> physical EVENT matrices (per stratum)
+#         model-independent, same as events
 # ------------------------------------------------------------
 physical_events_3wk <- setNames(vector("list", length(freq_strata)), names(freq_strata))
 for (st in names(freq_strata)) {
@@ -376,27 +382,38 @@ for (st in names(freq_strata)) {
 }
 
 # ------------------------------------------------------------
-# Step 7: Convert EVENTS -> UNIQUE PARTNERS via appear_factor
-#         (close and physical, all strata, all split locations + community)
+# Step 7: Convert EVENTS -> UNIQUE PARTNERS, for EACH of the 3 models
 # ------------------------------------------------------------
-close_unique_3wk    <- setNames(vector("list", length(freq_strata)), names(freq_strata))
-physical_unique_3wk <- setNames(vector("list", length(freq_strata)), names(freq_strata))
+close_unique_3wk_by_model    <- list()
+physical_unique_3wk_by_model <- list()
 
-for (st in names(freq_strata)) {
-  close_unique_3wk[[st]]    <- lapply(close_events_3wk[[st]],    function(m) m * appear_factor[st])
-  physical_unique_3wk[[st]] <- lapply(physical_events_3wk[[st]], function(m) m * appear_factor[st])
+for (mn in names(model_defs)) {
+  af <- appear_factor_by_model[[mn]]
+  close_unique_3wk_by_model[[mn]] <- setNames(vector("list", length(freq_strata)), names(freq_strata))
+  physical_unique_3wk_by_model[[mn]] <- setNames(vector("list", length(freq_strata)), names(freq_strata))
+  for (st in names(freq_strata)) {
+    close_unique_3wk_by_model[[mn]][[st]]    <- lapply(close_events_3wk[[st]],    function(m) m * af[st])
+    physical_unique_3wk_by_model[[mn]][[st]] <- lapply(physical_events_3wk[[st]], function(m) m * af[st])
+  }
 }
 
-message("\n== 3-week UNIQUE partner rowSums by stratum (close, community) ==")
-for (st in names(freq_strata)) {
-  mat <- close_unique_3wk[[st]]$community
-  message(sprintf("  %-8s: %.2f - %.2f", st,
-                  min(rowSums(mat)), max(rowSums(mat))))
+message("\n== 3-week UNIQUE partner rowSums by model x stratum (close, community) ==")
+for (mn in names(model_defs)) {
+  for (st in names(freq_strata)) {
+    mat <- close_unique_3wk_by_model[[mn]][[st]]$community
+    message(sprintf("  [%-5s] %-8s: %.2f - %.2f", mn, st,
+                    min(rowSums(mat)), max(rowSums(mat))))
+  }
 }
+
+# Backward-compatible top-level aliases (used by p7 / network build):
+# these remain the "s1" (current/default) model, unchanged in shape.
+close_unique_3wk    <- close_unique_3wk_by_model$s1
+physical_unique_3wk <- physical_unique_3wk_by_model$s1
 
 # ------------------------------------------------------------
 # Step 8: Home — close/physical split ONLY, no frequency stratification
-#         (data limitation: reserved for a separate treatment)
+#         (model-independent; home was never frequency-stratified)
 # ------------------------------------------------------------
 close_only_home <- prem_mats$home * (1 - blended_ratio$home)
 phys_only_home  <- prem_mats$home * blended_ratio$home
@@ -415,14 +432,13 @@ message(sprintf("  sum check (should equal prem_mats$home rowSums): %.3f - %.3f"
 
 # ------------------------------------------------------------
 # Step 9: Community-level stratum allocation probabilities
-#         (used e.g. to sample which stratum a given unique community
-#          contact belongs to, in downstream network generation)
+#         (uses the s1/current model, since this feeds p7's network build)
 # ------------------------------------------------------------
 prem_unique_community <- close_unique_3wk$daily$community +
   close_unique_3wk$weekly$community +
   close_unique_3wk$monthly$community
 
-message("\n== prem_unique_community rowSum range ==")
+message("\n== prem_unique_community rowSum range (s1 model) ==")
 message(sprintf("  %.2f - %.2f",
                 min(rowSums(prem_unique_community)),
                 max(rowSums(prem_unique_community))))
@@ -442,14 +458,25 @@ message(sprintf("  Stratum prob sum range: [%.4f, %.4f]",
 saveRDS(
   list(
     # events = raw 3-week contact counts (repeats included), by stratum
+    # (model-independent)
     close_events_3wk    = close_events_3wk,
     physical_events_3wk = physical_events_3wk,
-    # unique = estimated distinct partners over 3 weeks, by stratum
+
+    # unique = estimated distinct partners over 3 weeks, by stratum.
+    # Top-level close_unique_3wk / physical_unique_3wk = "s1" model,
+    # kept for backward compatibility with p7.
     close_unique_3wk    = close_unique_3wk,
     physical_unique_3wk = physical_unique_3wk,
+
+    # ALL THREE models' unique matrices (linear / s1 / s05)
+    close_unique_3wk_by_model    = close_unique_3wk_by_model,
+    physical_unique_3wk_by_model = physical_unique_3wk_by_model,
+    appear_factor_by_model       = appear_factor_by_model,
+
     # home: close/physical split only, no frequency stratification
     close_only_home = close_only_home,
     phys_only_home  = phys_only_home,
+
     # supporting outputs
     prem_unique_community = prem_unique_community,
     stratum_prob_mat       = stratum_prob_mat,
@@ -465,6 +492,9 @@ cat("\nSaved: output/MPMmat/DRC_network_input_matrices.rds\n")
 cat("NOTE: population (WorldPop) is intentionally NOT used anywhere in this\n")
 cat("      script. All matrices above are per-capita rates. Population\n")
 cat("      weighting belongs to the downstream node/network generation step.\n")
+cat("NOTE: close_unique_3wk / physical_unique_3wk (top-level) = 's1' model,\n")
+cat("      unchanged for p7 compatibility. All 3 models are also saved\n")
+cat("      under *_by_model for comparison / diagnostic use.\n")
 
 # ============================================================
 # Step 10: Visualization
@@ -515,8 +545,8 @@ make_heatmap_tile <- function(mat,
 # ----------------------------------------------------------
 # Plot (a): 1x3 heatmap — Prem close contact  [Panel A]  (unchanged)
 # ----------------------------------------------------------
-plot_locs_a       <- c("home", "work", "other")
-plot_loc_labels_a <- c("Home", "Work", "Other")
+plot_locs_a       <- c("work", "school", "other")
+plot_loc_labels_a <- c("Work", "School", "Other")
 
 shared_max_a <- max(sapply(plot_locs_a,
                            function(l) max(prem_mats[[l]], na.rm = TRUE)))
@@ -563,8 +593,7 @@ ggsave("figure/MPMmat/DRC_blended_ratio_heatmap_1x3.png",
 message("Saved: figure/MPMmat/DRC_blended_ratio_heatmap_1x3.png")
 
 # ----------------------------------------------------------
-# Plot (c): 1x3 heatmap — household contact structure  [Panel C]
-#           now reuses phys_only_home directly (no recompute)
+# Plot (c): 1x3 heatmap — household contact structure  [Panel C]  (unchanged)
 # ----------------------------------------------------------
 p_c1 <- make_heatmap_tile(
   prem_mats$home,
@@ -598,13 +627,8 @@ ggsave("figure/MPMmat/DRC_home_heatmap_1x3.png",
 message("Saved: figure/MPMmat/DRC_home_heatmap_1x3.png")
 
 # ----------------------------------------------------------
-# Plot (d): 3x3 age-stratified bar chart  [Panel D]
-#           Row A = 3-week EVENTS (close, repeats included)
-#           Row B = 3-week UNIQUE partners (close)
-#           Row C = 3-week UNIQUE partners, split into
-#                   non-physical (light) / physical (dark) per stratum
-#                   -> 6-segment stack: Monthly(np,p), Weekly(np,p), Daily(np,p)
-#           Population-free (per-capita rates only).
+# Plot (d0): 1x3 age-stratified bar chart — 3-week EVENTS
+#            (model-independent; unchanged across all 3 models)
 # ----------------------------------------------------------
 plot_locs_d       <- c("work", "school", "other")
 plot_loc_labels_d <- c("Work", "School", "Other")
@@ -612,11 +636,10 @@ plot_loc_labels_d <- c("Work", "School", "Other")
 freq_colors <- c("Daily" = "#993C1D", "Weekly" = "#0F6E56", "Monthly+" = "#185FA5")
 stratum_display <- c(daily = "Daily", weekly = "Weekly", monthly = "Monthly+")
 
-build_age_df <- function(loc, row_label) {
-  src <- if (row_label == "A") close_events_3wk else close_unique_3wk
+build_events_df <- function(loc) {
   rows <- lapply(seq_along(age_labels), function(i) {
     ag   <- age_labels[i]
-    vals <- sapply(names(freq_strata), function(st) rowSums(src[[st]][[loc]])[i])
+    vals <- sapply(names(freq_strata), function(st) rowSums(close_events_3wk[[st]][[loc]])[i])
     data.frame(age_group = ag,
                stratum   = unname(stratum_display[names(freq_strata)]),
                contacts  = as.numeric(vals))
@@ -624,40 +647,26 @@ build_age_df <- function(loc, row_label) {
   do.call(rbind, rows)
 }
 
-compute_y_max <- function(row_label) {
-  vals <- unlist(lapply(plot_locs_d, function(loc) {
-    df <- build_age_df(loc, row_label)
-    tapply(df$contacts, df$age_group, sum)
-  }))
-  max(vals, na.rm = TRUE) * 1.08
-}
+y_max_events <- max(unlist(lapply(plot_locs_d, function(loc) {
+  df <- build_events_df(loc)
+  tapply(df$contacts, df$age_group, sum)
+}))) * 1.08
 
-y_max_A <- compute_y_max("A")   # events (repeats included)
-y_max_B <- compute_y_max("B")   # unique partners (close, total)
-y_max_C <- y_max_B              # same total as Row B, just split by physical/non-physical
+make_bar_generic <- function(df, fill_col, color_map, level_order, llab, y_max,
+                             show_col_title = FALSE, show_x = FALSE,
+                             show_y_title = FALSE, y_title_text = "") {
+  df[[fill_col]] <- factor(df[[fill_col]], levels = level_order)
+  df$age_group   <- factor(df$age_group, levels = age_labels)
 
-make_bar <- function(loc, llab, row_label,
-                     y_max,
-                     show_col_title = FALSE,
-                     show_x         = FALSE,
-                     show_y_title   = FALSE) {
-  df <- build_age_df(loc, row_label)
-  df$age_group <- factor(df$age_group, levels = age_labels)
-  df$stratum   <- factor(df$stratum, levels = c("Monthly+", "Weekly", "Daily"))
-
-  y_title <- if (show_y_title) {
-    if (row_label == "A") "3-week contact events" else "3-week unique partners"
-  } else NULL
-
-  ggplot(df, aes(x = age_group, y = contacts, fill = stratum)) +
+  ggplot(df, aes(x = age_group, y = contacts, fill = .data[[fill_col]])) +
     geom_col(width = 0.8) +
-    scale_fill_manual(values = freq_colors, name = "Frequency") +
+    scale_fill_manual(values = color_map, name = fill_col) +
     scale_y_continuous(expand = expansion(mult = c(0, 0.03)),
                        limits = c(0, y_max)) +
     labs(
       title = if (show_col_title) llab else NULL,
       x     = if (show_x) "Age group" else NULL,
-      y     = y_title
+      y     = if (show_y_title) y_title_text else NULL
     ) +
     theme_minimal(base_size = 8) +
     theme(
@@ -673,8 +682,34 @@ make_bar <- function(loc, llab, row_label,
     )
 }
 
-# --- Row C: physical / non-physical split, 6-segment stack ---
-# Stacking order bottom -> top: Monthly(light,dark), Weekly(light,dark), Daily(light,dark)
+events_levels <- c("Monthly+", "Weekly", "Daily")
+
+panels_events <- mapply(function(loc, llab, i)
+  make_bar_generic(build_events_df(loc), "stratum", freq_colors, events_levels,
+                   llab, y_max_events,
+                   show_col_title = TRUE, show_x = TRUE,
+                   show_y_title = (i == 1), y_title_text = "3-week contact events"),
+  plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
+
+legend_events <- get_legend(
+  make_bar_generic(build_events_df("work"), "stratum", freq_colors, events_levels,
+                   "Work", y_max_events) +
+    theme(legend.position = "right")
+)
+
+grid_events <- plot_grid(plotlist = panels_events, nrow = 1, ncol = 3)
+grid_events_full <- plot_grid(grid_events, legend_events, nrow = 1, rel_widths = c(1, 0.12))
+
+ggsave("figure/MPMmat/DRC_rarefaction_events_1x3.png",
+       grid_events_full, width = 12, height = 4, dpi = 300)
+message("Saved: figure/MPMmat/DRC_rarefaction_events_1x3.png")
+
+# ----------------------------------------------------------
+# Plot (d1-d3): per-model UNIQUE partner charts (2x3 each):
+#   Row 1 = close-only, 3-segment stack (Daily/Weekly/Monthly+)
+#   Row 2 = close/physical split, 6-segment stack
+# All three models share ONE y-axis scale for direct comparability.
+# ----------------------------------------------------------
 freq_colors_6 <- c(
   "Monthly+ (non-physical)" = "#B9D4EC",  # light blue
   "Monthly+ (physical)"     = "#185FA5",  # dark blue
@@ -685,12 +720,38 @@ freq_colors_6 <- c(
 )
 stack_levels_6 <- names(freq_colors_6)
 
-build_physical_split_df <- function(loc) {
+# Row1 (close, 3-seg) uses levels=c("Monthly+","Weekly","Daily") directly,
+# which stacks top-to-bottom as Monthly+(blue) / Weekly(green) / Daily(brown).
+# To make Row2 (physical-split, 6-seg) match that SAME top-to-bottom color
+# order (blue on top, brown on bottom), the macro group order must also go
+# Monthly -> Weekly -> Daily from top to bottom, with physical stacked above
+# non-physical within each color pair (unchanged sub-order):
+level_order_6 <- c(
+  "Monthly+ (physical)", "Monthly+ (non-physical)",
+  "Weekly (physical)",   "Weekly (non-physical)",
+  "Daily (physical)",    "Daily (non-physical)"
+)
+
+build_unique_close_df <- function(loc, model_name) {
+  src <- close_unique_3wk_by_model[[model_name]]
+  rows <- lapply(seq_along(age_labels), function(i) {
+    ag   <- age_labels[i]
+    vals <- sapply(names(freq_strata), function(st) rowSums(src[[st]][[loc]])[i])
+    data.frame(age_group = ag,
+               stratum   = unname(stratum_display[names(freq_strata)]),
+               contacts  = as.numeric(vals))
+  })
+  do.call(rbind, rows)
+}
+
+build_unique_split_df <- function(loc, model_name) {
+  src_close <- close_unique_3wk_by_model[[model_name]]
+  src_phys  <- physical_unique_3wk_by_model[[model_name]]
   rows <- lapply(seq_along(age_labels), function(i) {
     ag <- age_labels[i]
     do.call(rbind, lapply(names(freq_strata), function(st) {
-      total_i <- rowSums(close_unique_3wk[[st]][[loc]])[i]
-      phys_i  <- rowSums(physical_unique_3wk[[st]][[loc]])[i]
+      total_i   <- rowSums(src_close[[st]][[loc]])[i]
+      phys_i    <- rowSums(src_phys[[st]][[loc]])[i]
       nonphys_i <- total_i - phys_i
       lab <- stratum_display[[st]]
       data.frame(
@@ -703,96 +764,156 @@ build_physical_split_df <- function(loc) {
   do.call(rbind, rows)
 }
 
-make_bar_split <- function(loc, llab, y_max,
-                           show_col_title = FALSE,
-                           show_x         = FALSE,
-                           show_y_title   = FALSE) {
-  df <- build_physical_split_df(loc)
-  df$age_group <- factor(df$age_group, levels = age_labels)
-  df$segment   <- factor(df$segment, levels = rev(stack_levels_6))
+# Shared y-axis across ALL models and BOTH chart types
+y_max_unique <- max(unlist(lapply(names(model_defs), function(mn) {
+  sapply(plot_locs_d, function(loc) {
+    df <- build_unique_close_df(loc, mn)
+    max(tapply(df$contacts, df$age_group, sum))
+  })
+}))) * 1.08
 
-  ggplot(df, aes(x = age_group, y = contacts, fill = segment)) +
-    geom_col(width = 0.8) +
-    scale_fill_manual(values = freq_colors_6, name = "Frequency x Physical") +
-    scale_y_continuous(expand = expansion(mult = c(0, 0.03)),
-                       limits = c(0, y_max)) +
+message(sprintf("\nShared y_max for unique-partner charts (all models): %.2f", y_max_unique))
+
+render_model_unique_figure <- function(model_name) {
+  panels_close <- mapply(function(loc, llab, i)
+    make_bar_generic(build_unique_close_df(loc, model_name), "stratum",
+                     freq_colors, events_levels, llab, y_max_unique,
+                     show_col_title = TRUE, show_x = FALSE,
+                     show_y_title = (i == 1), y_title_text = "3-week unique partners"),
+    plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
+
+  panels_split <- mapply(function(loc, llab, i)
+    make_bar_generic(build_unique_split_df(loc, model_name), "segment",
+                     freq_colors_6, level_order_6, llab, y_max_unique,
+                     show_col_title = FALSE, show_x = TRUE,
+                     show_y_title = (i == 1), y_title_text = "3-week unique partners"),
+    plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
+
+  legend_close <- get_legend(
+    make_bar_generic(build_unique_close_df("work", model_name), "stratum",
+                     freq_colors, events_levels, "Work", y_max_unique) +
+      theme(legend.position = "right")
+  )
+  legend_split <- get_legend(
+    make_bar_generic(build_unique_split_df("work", model_name), "segment",
+                     freq_colors_6, level_order_6, "Work", y_max_unique) +
+      theme(legend.position = "right")
+  )
+
+  grid_body <- plot_grid(
+    panels_close[[1]], panels_close[[2]], panels_close[[3]],
+    panels_split[[1]], panels_split[[2]], panels_split[[3]],
+    nrow = 2, ncol = 3, rel_heights = c(1, 1.15)
+  )
+  legends_stacked <- plot_grid(legend_close, legend_split, ncol = 1, rel_heights = c(1, 1))
+  grid_with_legend <- plot_grid(grid_body, legends_stacked, nrow = 1, rel_widths = c(1, 0.18))
+
+  title_bar <- ggdraw() +
+    draw_label(model_labels[model_name], fontface = "bold", size = 12)
+
+  grid_full <- plot_grid(title_bar, grid_with_legend, ncol = 1, rel_heights = c(0.07, 1))
+
+  out_path <- sprintf("figure/MPMmat/DRC_unique_edges_2x3_%s.png", model_name)
+  ggsave(out_path, grid_full, width = 12, height = 7.5, dpi = 300)
+  message(sprintf("Saved: %s", out_path))
+}
+
+for (mn in names(model_defs)) {
+  render_model_unique_figure(mn)
+}
+
+# ----------------------------------------------------------
+# Plot (g1-g3): per-model UNIQUE contact matrix heatmaps (1x3: work/school/
+#               other), summed across daily+weekly+monthly. Same orange
+#               scale as Plot A, shared across all three models for direct
+#               comparison. Cell values shown as integers, no colorbar
+#               (legend removed — values are printed directly on tiles).
+# ----------------------------------------------------------
+plot_locs_g       <- c("work", "school", "other")
+plot_loc_labels_g <- c("Work", "School", "Other")
+
+total_unique_mat_by_model <- lapply(names(model_defs), function(mn) {
+  src <- close_unique_3wk_by_model[[mn]]
+  setNames(
+    lapply(plot_locs_g, function(loc)
+      src$daily[[loc]] + src$weekly[[loc]] + src$monthly[[loc]]),
+    plot_locs_g
+  )
+})
+names(total_unique_mat_by_model) <- names(model_defs)
+
+shared_max_g <- max(sapply(names(model_defs), function(mn)
+  max(sapply(plot_locs_g, function(loc)
+    max(total_unique_mat_by_model[[mn]][[loc]], na.rm = TRUE)))))
+
+message(sprintf("\nShared color scale max for unique-matrix heatmaps (all models): %.2f",
+                shared_max_g))
+
+# Numbered, no-legend heatmap tile (used only for the unique-edge matrices)
+make_heatmap_tile_numbered <- function(mat,
+                                       col_title,
+                                       low_col, high_col,
+                                       scale_limits,
+                                       show_y = FALSE) {
+  df <- mat_to_long(mat, age_labels)
+  df$participant <- factor(df$participant, levels = age_labels)
+  df$contact     <- factor(df$contact,     levels = age_labels)
+  df$label       <- as.character(round(df$value))
+
+  # text color flips to white on dark tiles for readability
+  mid_val   <- mean(scale_limits)
+  df$txt_col <- ifelse(df$value > mid_val, "white", "black")
+
+  ggplot(df, aes(x = contact, y = participant, fill = value)) +
+    geom_tile(color = NA) +
+    geom_text(aes(label = label, color = txt_col), size = 1.9) +
+    scale_color_identity() +
+    scale_fill_gradient(low = low_col, high = high_col,
+                        limits = scale_limits, na.value = "grey90",
+                        guide = "none") +
+    scale_x_discrete(guide = guide_axis(angle = 90)) +
     labs(
-      title = if (show_col_title) llab else NULL,
-      x     = if (show_x) "Age group" else NULL,
-      y     = if (show_y_title) "3-week unique partners" else NULL
+      title = col_title,
+      x     = "Contact age",
+      y     = if (show_y) "Participant age" else NULL
     ) +
     theme_minimal(base_size = 8) +
     theme(
-      plot.title         = element_text(size = 9, face = "bold", hjust = 0.5),
-      plot.margin        = margin(3, 4, 3, 4),
-      axis.text.x        = if (show_x) element_text(size = 5, angle = 45, hjust = 1)
-      else element_blank(),
-      axis.ticks.x       = element_blank(),
-      axis.text.y        = element_text(size = 6),
-      axis.title         = element_text(size = 7),
-      legend.position    = "none",
-      panel.grid.major.x = element_blank()
+      plot.title  = element_text(size = 8, face = "bold", hjust = 0.5),
+      axis.text   = element_text(size = 7),
+      axis.title  = element_text(size = 7),
+      panel.grid  = element_blank(),
+      plot.margin = margin(3, 4, 3, 4)
     )
 }
 
-plots_A <- mapply(function(loc, llab, i)
-  make_bar(loc, llab, row_label = "A", y_max = y_max_A,
-           show_col_title = TRUE,
-           show_x         = FALSE,
-           show_y_title   = (i == 1)),
-  plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
+render_model_matrix_heatmap <- function(model_name) {
+  mats_this <- total_unique_mat_by_model[[model_name]]
 
-plots_B <- mapply(function(loc, llab, i)
-  make_bar(loc, llab, row_label = "B", y_max = y_max_B,
-           show_col_title = FALSE,
-           show_x         = FALSE,
-           show_y_title   = (i == 1)),
-  plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
+  panels_g <- mapply(function(loc, llab, i) {
+    make_heatmap_tile_numbered(
+      mats_this[[loc]],
+      col_title    = llab,
+      low_col      = "#FAEEDA", high_col = "#BA7517",
+      scale_limits = c(0, shared_max_g),
+      show_y       = (i == 1)
+    )
+  }, plot_locs_g, plot_loc_labels_g, seq_along(plot_locs_g), SIMPLIFY = FALSE)
 
-plots_C <- mapply(function(loc, llab, i)
-  make_bar_split(loc, llab, y_max = y_max_C,
-                 show_col_title = FALSE,
-                 show_x         = TRUE,
-                 show_y_title   = (i == 1)),
-  plot_locs_d, plot_loc_labels_d, seq_along(plot_locs_d), SIMPLIFY = FALSE)
+  grid_g <- plot_grid(plotlist = panels_g, nrow = 1, ncol = 3)
 
-shared_legend_ab <- get_legend(
-  make_bar("work", "Work", "A", y_max_A) + theme(legend.position = "right")
-)
+  title_bar <- ggdraw() +
+    draw_label(model_labels[model_name], fontface = "bold", size = 12)
+  grid_full <- plot_grid(title_bar, grid_g, ncol = 1, rel_heights = c(0.1, 1))
 
-shared_legend_c <- get_legend(
-  make_bar_split("work", "Work", y_max_C) + theme(legend.position = "right")
-)
+  out_path <- sprintf("figure/MPMmat/DRC_unique_matrix_heatmap_1x3_%s.png", model_name)
+  ggsave(out_path, grid_full, width = 11, height = 3.7, dpi = 300)
+  message(sprintf("Saved: %s", out_path))
+}
 
-grid_d <- plot_grid(
-  plots_A[[1]], plots_A[[2]], plots_A[[3]],
-  plots_B[[1]], plots_B[[2]], plots_B[[3]],
-  plots_C[[1]], plots_C[[2]], plots_C[[3]],
-  nrow = 3, ncol = 3, rel_heights = c(1, 1, 1.15)
-)
-
-legends_stacked <- plot_grid(shared_legend_ab, shared_legend_c,
-                             ncol = 1, rel_heights = c(1, 1))
-
-grid_d_with_legend <- plot_grid(grid_d, legends_stacked,
-                                nrow = 1, rel_widths = c(1, 0.12))
-
-ggsave("figure/MPMmat/DRC_rarefaction_ABC_by_age_3x3.png",
-       grid_d_with_legend,
-       width = 12, height = 10, dpi = 300)
-message("Saved: figure/MPMmat/DRC_rarefaction_ABC_by_age_3x3.png")
-
-# ----------------------------------------------------------
-# Plot (e): population-weighted summary — REMOVED from this script.
-#
-# The original Plot E aggregated per-capita rates by multiplying with
-# WorldPop population shares to get a population-level "total contact
-# burden" summary. That is a downstream (node/network generation) concern,
-# not part of building the per-capita rate matrices themselves, so it has
-# been intentionally dropped here. Re-introduce it in the next script,
-# where population counts are loaded, using:
-#   close_events_3wk / close_unique_3wk (this script's outputs) x pop counts
-# ----------------------------------------------------------
+for (mn in names(model_defs)) {
+  render_model_matrix_heatmap(mn)
+}
 
 # ----------------------------------------------------------
 # Plot (b-2): 1x3 heatmap — POLYMOD original physical ratio
